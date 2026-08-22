@@ -1,0 +1,101 @@
+# agent-rules manifest
+#
+# Keyed on the ORIGIN REMOTE SLUG, never on directory name or filename.
+# Local checkout paths do not match slugs (engels74/afisharr lives at
+# afisharr-project/afisharr; poyo-studio has a second checkout at poyo-local),
+# so `bin/sync` discovers repos by reading `git remote get-url origin`.
+
+[defaults]
+# Rule files are not committed into a consumer repo unless that repo opts in
+# with `publish = true`.
+#
+# Publishing means the rule files are committed to the consumer repo, so they
+# travel to CI, cloud agents and fresh clones.
+#
+# Repos that must not appear in a public target list live in
+# manifest.local.toml instead, which is gitignored. bin/sync reads both.
+publish = false
+
+# Exclusion is written to .git/info/exclude, not .gitignore, so hydration
+# leaves ZERO committed artifact. A shared .gitignore line would itself be a
+# (weak) cross-account fingerprint.
+exclude_via = "info"
+
+# Anything in .agents/rules/ not listed under `rules` or `keep` is pruned.
+# Dry-run is the default; pruning requires `bin/sync --apply`.
+
+[[repo]]
+slug  = "engels74/afisharr"
+rules = ["svelte5-sveltekit-app", "rust-1_98-core"]
+publish = true
+
+[[repo]]
+slug  = "engels74/arrsenal-of-scripts"
+rules = ["python-3_14-core"]
+publish = true
+note  = "12 Bash scripts uncovered (D11)"
+
+[[repo]]
+slug  = "engels74/cdiag.link"
+rules = ["astro-svelte5-islands"]
+publish = true
+note  = "one real .tsx + @astrojs/solid-js still to port (D8)"
+
+[[repo]]
+slug  = "engels74/claude-atoll-web"
+rules = ["astro-svelte5-islands", "python-3_14-core"]
+publish = true
+
+[[repo]]
+slug  = "engels74/claude-diag"
+rules = ["python-3_14-core"]
+publish = true
+
+[[repo]]
+slug  = "engels74/comradarr"
+rules = ["svelte5-sveltekit-app", "python-3_14-litestar-api"]
+publish = true
+
+[[repo]]
+slug  = "engels74/EasyHDR"
+rules = ["rust-1_98-core"]
+publish = true
+note  = "Slint GUI uncovered by design (D10)"
+
+[[repo]]
+slug  = "engels74/obzorarr"
+rules = ["svelte5-sveltekit-app"]
+publish = true
+
+[[repo]]
+slug  = "engels74/otpravkarr"
+rules = ["svelte5-sveltekit-app"]
+publish = true
+
+[[repo]]
+slug  = "engels74/poyo-studio"
+rules = ["svelte5-sveltekit-app"]
+publish = true
+note  = "second checkout exists at poyo-local; same origin, both hydrate"
+
+[[repo]]
+slug  = "engels74/tgraph-bot-source"
+rules = ["python-3_14-core"]
+publish = true
+note  = "pins >=3.12 against siblings on 3.14; bump repo (D5)"
+
+[[repo]]
+slug  = "engels74/wings-vpn"
+rules = ["go-1_27-core"]
+publish = true
+
+[[repo]]
+slug  = "engels74/zimuarr"
+rules = ["svelte5-sveltekit-app", "python-3_14-litestar-api"]
+publish = true
+
+[[repo]]
+slug  = "engels74/zondarr"
+rules = ["svelte5-sveltekit-app", "python-3_14-litestar-api"]
+publish = true
+
