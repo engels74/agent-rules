@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Agent tooling state
+.omc/
+.claude/settings.local.json
+
+# Sync run artifacts — may contain local absolute paths and repo inventories
+.sync-cache/
+*.sync.log
+report-*.txt
+
+# Local-only manifest for non-publishing accounts — never commit
+manifest.local.toml
