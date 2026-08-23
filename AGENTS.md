@@ -11,7 +11,9 @@ without being asked.
 
 - **`publish` defaults to `false`.** A repo commits its rule files only by
   opting in. Repos that must not appear in a public target list belong in
-  `manifest.local.toml`, which is gitignored.
+  the local manifest, resolved outside the worktree (see README). Never move
+  those entries into `manifest.toml`, and never add a path under
+  `$XDG_CONFIG_HOME` to a committed file.
 - **Key on the origin remote slug.** Local directory names do not match slugs
   (`engels74/afisharr` lives at `afisharr-project/afisharr`; `poyo-studio` has a
   second checkout at `poyo-local`). Never infer a repo from its path.

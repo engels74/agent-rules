@@ -26,13 +26,25 @@ fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${AGENT_RULES_ROOT:-$HOME/Documents/GitHub}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 APPLY=0; FILTER=()
+
+# ---- locate the local-only consumer list ------------------------------------
+# Resolved OUTSIDE the worktree by default. In-tree it was gitignored, so it
+# could never be pushed — but it was still deletable by `git clean -xdf`,
+# absent from a fresh clone, and one `git add -f` from being staged. None of
+# those apply to a file git cannot see at all. The in-repo path stays as a
+# fallback so existing checkouts keep working.
 LOCAL_MANIFEST=""
-[ -f "$HERE/manifest.local.toml" ] && LOCAL_MANIFEST="$HERE/manifest.local.toml"
+for c in "${AGENT_RULES_LOCAL_MANIFEST:-}" \
+         "$CONFIG_HOME/agent-rules/manifest.local.toml" \
+         "$HERE/manifest.local.toml"; do
+  [ -n "$c" ] && [ -f "$c" ] && { LOCAL_MANIFEST="$c"; break; }
+done
 for a in "$@"; do
   case "$a" in
     --apply) APPLY=1 ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) FILTER+=("$a") ;;
   esac
@@ -41,6 +53,53 @@ done
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
+
+# ---- commit-time leak guard -------------------------------------------------
+# .git/info/exclude stops `git add -A`, but not `git add -f`, not an explicit
+# path add, and not an IDE "stage all". This hook is the hard stop. It lives in
+# .git/hooks/, so like info/exclude it leaves no committed artifact.
+#
+# Most consumers already run a prek-generated pre-commit hook, so an existing
+# foreign hook is moved aside and chained rather than clobbered. If prek later
+# reinstalls its own, the next sync run re-chains it — the orphan is simply
+# overwritten, since both copies are prek-generated and equivalent.
+GUARD_MARK='agent-rules-leak-guard'
+
+install_guard(){ local wt="$1" hd g chain
+  hd="$(git -C "$wt" rev-parse --absolute-git-dir)/hooks"; mkdir -p "$hd"
+  g="$hd/pre-commit"; chain="$hd/pre-commit.chained"
+  if [ -f "$g" ] && ! grep -q "$GUARD_MARK" "$g"; then
+    mv "$g" "$chain"; chmod +x "$chain"
+    ylw "   chained    existing pre-commit hook → pre-commit.chained"
+  fi
+  cat >"$g" <<'HOOK'
+#!/bin/sh
+# agent-rules-leak-guard — installed by bin/sync. Do not edit.
+# This repo hydrates .agents/rules/ locally and must never commit it.
+staged=$(git diff --cached --name-only --diff-filter=ACMR | grep '^\.agents/rules/' || true)
+if [ -n "$staged" ]; then
+  echo "BLOCKED: .agents/rules/ must never be committed in this repo." >&2
+  echo "$staged" | sed 's/^/  /' >&2
+  echo "unstage with:  git restore --staged .agents/rules/" >&2
+  exit 1
+fi
+chain="$(dirname "$0")/pre-commit.chained"
+[ -x "$chain" ] && exec "$chain" "$@"
+exit 0
+HOOK
+  chmod +x "$g"
+}
+
+# Symmetric removal: a repo that flips to publish=true must be able to commit
+# .agents/rules again, so a stale guard has to come off and the chain restored.
+remove_guard(){ local wt="$1" hd g chain
+  hd="$(git -C "$wt" rev-parse --absolute-git-dir)/hooks"
+  g="$hd/pre-commit"; chain="$hd/pre-commit.chained"
+  [ -f "$g" ] && grep -q "$GUARD_MARK" "$g" || return 0
+  if [ -f "$chain" ]; then mv "$chain" "$g"; chmod +x "$g"
+    ylw "   unchained  restored pre-commit hook (publish=true)"
+  else rm -f "$g"; ylw "   removed    leak guard (publish=true)"; fi
+}
 
 # ---- preflight -------------------------------------------------------------
 # A rule file with no final newline makes end-of-file-fixer rewrite it in every
@@ -157,17 +216,18 @@ while IFS='|' read -r slug rules archived nested publish; do
     # 4. publish: stage adds + deletions, and lift any stale exclusion
     #    (git add refuses an excluded path, so the line must go first)
     if [ $APPLY -eq 1 ] && [ "$publish" = "true" ]; then
-      ex="$(git -C "$wt" rev-parse --git-dir)/info/exclude"
+      ex="$(git -C "$wt" rev-parse --absolute-git-dir)/info/exclude"
       if grep -qxF '.agents/rules/' "$ex" 2>/dev/null; then
         grep -vxF '.agents/rules/' "$ex" >"$ex.tmp" && mv "$ex.tmp" "$ex"
       fi
+      remove_guard "$wt"
       git -C "$wt" add -A .agents/rules 2>/dev/null || true
       grn "   staged     .agents/rules (publish=true)"
     fi
 
     # 4b. do-not-publish: exclude via .git/info/exclude — no committed artifact
     if [ $APPLY -eq 1 ] && [ "$publish" != "true" ]; then
-      ex="$(git -C "$wt" rev-parse --git-dir)/info/exclude"
+      ex="$(git -C "$wt" rev-parse --absolute-git-dir)/info/exclude"
       grep -qxF '.agents/rules/' "$ex" 2>/dev/null || {
         mkdir -p "$(dirname "$ex")"; printf '.agents/rules/\n' >>"$ex"; }
       # 5. assert the guard actually holds — a stray `git add -A` must not leak
@@ -175,6 +235,8 @@ while IFS='|' read -r slug rules archived nested publish; do
         git -C "$wt" check-ignore -q ".agents/rules/$b" || {
           red "   LEAK RISK  .agents/rules/$b is NOT ignored"; fail=1; }
       done
+      # 6. hard stop for the paths info/exclude cannot cover (add -f, IDEs)
+      install_guard "$wt"
     fi
     unset want
   done

@@ -43,8 +43,17 @@ alone survive any paraphrasing — so some repos are hydrated locally instead an
 commit nothing.
 
 Targets live in two places: `manifest.toml` for published repos, and an
-optional `manifest.local.toml` (gitignored) for repos that should never appear
-in a public list. `bin/sync` reads both.
+optional `manifest.local.toml` for repos that should never appear in a public
+list. `bin/sync` reads both.
+
+The local manifest is resolved outside this worktree, first match wins:
+
+1. `$AGENT_RULES_LOCAL_MANIFEST`
+2. `$XDG_CONFIG_HOME/agent-rules/manifest.local.toml` (default `~/.config`)
+3. `./manifest.local.toml` — legacy fallback, gitignored
+
+Prefer 2. In-tree it was unpushable but still deletable by `git clean -xdf`,
+missing from a fresh clone, and one `git add -f` from being staged.
 
 For `publish = false` repos, exclusion is written to `.git/info/exclude` rather
 than `.gitignore`, because `.gitignore` is itself committed — a shared ignore

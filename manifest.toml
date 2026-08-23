@@ -12,8 +12,9 @@
 # Publishing means the rule files are committed to the consumer repo, so they
 # travel to CI, cloud agents and fresh clones.
 #
-# Repos that must not appear in a public target list live in
-# manifest.local.toml instead, which is gitignored. bin/sync reads both.
+# Repos that must not appear in a public target list live in the local
+# manifest instead, resolved outside this worktree (see README).
+# bin/sync reads both.
 publish = false
 
 # Exclusion is written to .git/info/exclude, not .gitignore, so hydration
