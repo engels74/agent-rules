@@ -42,6 +42,17 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 ylw(){ printf '\033[33m%s\033[0m\n' "$*"; }
 
+# ---- preflight -------------------------------------------------------------
+# A rule file with no final newline makes end-of-file-fixer rewrite it in every
+# consumer that runs prek. The rewritten copy then differs from canonical and
+# gets overwritten on the next sync, which is a permanent loop. Refuse to ship.
+bad=0
+for f in "$HERE"/rules/*.md; do
+  [ -e "$f" ] || continue
+  [ -n "$(tail -c1 "$f")" ] && { red "malformed: rules/$(basename "$f") has no final newline"; bad=1; }
+done
+[ $bad -eq 0 ] || { red "refusing to sync"; exit 1; }
+
 # ---- discover checkouts by ORIGIN SLUG, never by directory name -------------
 # Local paths do not match slugs (afisharr-project/afisharr, poyo-local), and a
 # single slug may have several checkouts. Both must hydrate.
