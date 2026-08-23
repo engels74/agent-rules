@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "group:allNonMajor"],
+  "gitIgnoredAuthors": [
+    "41898282+github-actions[bot]@users.noreply.github.com",
+    "300104067+engels74-bot@users.noreply.github.com"
+  ],
+  "rebaseWhen": "conflicted",
+  "prConcurrentLimit": 10,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "npm pins documented inside the canonical rule files. These are the repo's real dependency surface — there is no package.json — and a stale pin here reaches every consumer at once.",
+      "managerFilePatterns": ["/^rules/.+\\.md$/"],
+      "matchStrings": [
+        "\"(?<depName>@?[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?)\"\\s*:\\s*\"(?<currentValue>\\^?\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep rule-file pins in their own PR: merging one triggers the fan-out to every consumer, so it warrants more scrutiny than a workflow bump.",
+      "matchManagers": ["custom.regex"],
+      "groupName": "rule-file pins"
+    },
+    {
+      "description": "TypeScript is held at 5.9 deliberately. 7.x is the Go rewrite, and the rule text leans on 5.8/5.9 semantics (erasableSyntaxOnly, verbatimModuleSyntax). Bumping it is a migration decision across every consumer, not drift cleanup.",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["typescript"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    }
+  ]
+}
