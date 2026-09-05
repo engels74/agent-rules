@@ -16,7 +16,7 @@ publishing leaves nothing in the repo at all — see [Why the split](#why-the-sp
 ## Layout
 
 ```
-rules/           9 canonical files, flat — source is the artifact
+rules/           12 canonical files, flat — source is the artifact
 manifest.toml    origin slug -> rules, keyed on the remote, never on path
 bin/sync         hydrate, de-publish, prune, verify
 docs/            toolchain floors and other cross-repo facts

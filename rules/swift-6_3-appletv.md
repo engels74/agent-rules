@@ -1,750 +1,640 @@
 ---
 type: "agent_requested"
-description: "Swift 6 + tvOS 26 Apple TV coding guidelines"
+description: "Swift 6 tvOS (SwiftUI + AVKit + UniFFI) coding guidelines"
 ---
-# Apple TV Engineering: Swift 6.3, tvOS 26, and the Focus-First Living Room Stack
+# Swift 6.3 on tvOS: SwiftUI, AVKit, and a Rust Core over UniFFI
 
-The user-named "tvOS 18" is superseded: as of August 2026 the current shipping platform is **tvOS 26** (26.5, released May 2026), built with **Xcode 26.x** and **Swift 6.3** (6.3.1 was the stable release on 17 April 2026; Swift 6.4 is still in preview and must not be targeted). Target tvOS 26 with the tvOS 26 SDK, Swift 6 language mode with strict concurrency, SwiftUI as the primary UI layer, SwiftPM for modularization, XcodeGen for the `.xcodeproj`, AVFoundation/AVKit for playback, UniFFI for a Rust core, and SwiftLint 0.65.x for style. This stack is exceptional at one thing above all: a **focus-driven, 10-foot media experience** rendered by SwiftUI and played by AVPlayer, with data-race safety guaranteed at compile time.
+This stack builds a native Apple TV app: a SwiftUI interface driven by the tvOS focus engine, media playback through AVKit, and shared business logic compiled from Rust and surfaced to Swift by UniFFI, all assembled with an XcodeGen-generated project over Swift Package Manager. It is exceptional at delivering a fluid 10-foot media experience with a small, testable Swift layer sitting on a portable Rust core. Optimize for: the focus-driven navigation model (nothing is "tapped" — everything is *focused* then selected), main-actor-by-default concurrency with narrow, deliberate escapes to the background, a clean `Sendable` boundary between the Rust core and SwiftUI, and disciplined resource cleanup around `AVPlayer`.
 
-The single biggest way agents write wrong-but-plausible code here is **importing iOS/UIKit habits**. Apple TV has no touchscreen, no tap gestures, no swipe-to-dismiss, no `NavigationView` push-by-tap — every interaction flows through the **focus engine** driven by the Siri Remote. Modifiers agents reach for reflexively (`.onTapGesture`, `DragGesture`, `.navigationBarItems`, `.hoverEffect(.lift)` as an interaction, `.searchable` styling assumptions, `.refreshable`) either don't exist, don't fire, or behave differently on tvOS. The second-biggest mistake is fighting Swift 6 concurrency instead of adopting it: Xcode 26 turns on **main-actor-by-default isolation** for new app targets, so most SwiftUI code is already on the main actor and should stay there — reach for concurrency deliberately, not defensively. Optimize for: correct focus structure, `@MainActor`-by-default UI code with explicit `@concurrent` escapes, `AVPlayerViewController` for playback (not a hand-rolled player), and clean actor boundaries around the UniFFI-generated Rust surface.
+The biggest ways agents write wrong-but-plausible code here come from importing iOS/phone habits: reaching for gestures, sheets, and `TextField`-heavy forms that do not fit tvOS; assuming a writable `Documents` directory (tvOS has none — only a purgeable `Caches`); wrapping every `nonisolated` async function expecting it to hop to the background (under approachable concurrency it now runs on the caller's actor unless marked `@concurrent`); marking UniFFI-generated types `@unchecked Sendable` to silence the compiler; and treating `AVPlayer` KVO/time observers as fire-and-forget instead of owning their teardown. Write code that assumes the main actor, escapes it on purpose, and cleans up after itself.
 
-## Swift 6 strict concurrency and actor isolation
+## Toolchain, language mode, and deployment target
 
-Xcode 26 creates new app targets with **Approachable Concurrency** and **default main-actor isolation** enabled. This is the posture to write for. The two build settings that define it:
+Three version axes are independent and must not be conflated:
 
-```
-SWIFT_APPROACHABLE_CONCURRENCY = YES     // umbrella; enables SE-0461 caller-runs behavior
-SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor // SE-0466; whole module defaults to @MainActor
-```
+- **Toolchain / SDK:** Swift 6.3, shipped in Xcode 26.4 with the tvOS 26 SDK. Build against the current SDK.
+- **Language mode:** Swift 6 (`-swift-version 6` / `.swiftLanguageMode(.v6)`). This turns data-race diagnostics into errors.
+- **Minimum deployment target:** tvOS 18. This is a floor to build on, not a value to bump. Newer SDK APIs (anything gated to tvOS 26) are usable only behind an `if #available(tvOS 26, *)` check; code that supports tvOS 18 behind such a check is current code, not legacy.
 
-The rationale, from SE-0466 ("Control default actor isolation inference"): a lot of app code is effectively single-threaded — it "start[s] running on the main actor and stay[s] there unless some part of the code does something concurrent," so under the old defaults "every concurrency diagnostic is necessarily a false positive." Default main-actor isolation removes that noise. Under this model your `App`, `View`s, view models, and plain classes are implicitly `@MainActor`. You do not annotate them. The app is effectively single-threaded until you *explicitly* leave the main actor. This is correct for a TV app: UI, focus, and playback control all belong on the main thread.
+Adopt **approachable concurrency**: default every app/UI module to `@MainActor` isolation and escape deliberately. This is the modern default for app targets and eliminates the annotation noise that made earlier Swift 6 adoption painful.
 
-Critical insight: **SPM library targets do NOT inherit `defaultIsolation`** — a newly created Swift package has no default isolation set, so its code is `nonisolated` unless you say otherwise. Set it explicitly per target in `Package.swift` (see the SwiftPM section) so a feature module behaves like the app.
+A note on the new performance types: `InlineArray` and `Span` (introduced with the 6.2 standard library) are attractive for FFI buffer handling, but on Apple platforms their availability floor is tvOS 26. With a tvOS 18 minimum they require an availability check, so reserve them for genuinely hot paths and gate them; do not scatter them through ordinary view or model code.
 
-Escape to the background *on purpose* with `@concurrent` (Swift 6.2+) for CPU-bound work — image decoding, JSON parsing of a large catalog, thumbnail generation:
+## Project generation with XcodeGen
 
-```swift
-import Foundation
-
-@MainActor
-final class CatalogViewModel {
-    private(set) var rows: [CatalogRow] = []
-
-    func load() async throws {
-        let data = try await api.fetchCatalog()      // network, suspends on main actor safely
-        rows = try await Self.decode(data)           // hops to background, hops back
-    }
-
-    // Runs off the main actor. Inputs/outputs must be Sendable.
-    @concurrent
-    private static func decode(_ data: Data) async throws -> [CatalogRow] {
-        try JSONDecoder().decode([CatalogRow].self, from: data)
-    }
-}
-```
-
-Use `actor` for mutable shared state that many tasks touch — a download coordinator, an in-memory key cache:
-
-```swift
-actor ContentKeyCache {
-    private var keys: [String: Data] = [:]
-    func key(for id: String) -> Data? { keys[id] }
-    func store(_ data: Data, for id: String) { keys[id] = data }
-}
-```
-
-`Sendable` is the currency of crossing isolation boundaries. Make model types `struct` with `Sendable` stored properties and they are `Sendable` for free. For a reference type that is immutable after init, prefer `final class Foo: Sendable` with only `let` properties. Swift 6.2 also allows `~Sendable` to explicitly opt a type out when it must stay isolated.
-
-`nonisolated` marks members that touch no isolated state and can run anywhere — use it for pure helpers and for protocol conformances like `CustomStringConvertible` on a `@MainActor` type:
-
-```swift
-@MainActor
-final class PlayerController {
-    nonisolated let id: UUID = UUID()          // immutable, safe anywhere
-    nonisolated var description: String { "Player" }  // touches no isolated state
-    private var player: AVPlayer?              // main-actor isolated
-}
-```
-
-Anti-habit to drop: do **not** sprinkle `Task { @MainActor in ... }` and `DispatchQueue.main.async` to "get back to the UI." Under default main-actor isolation you are already there. Use `Task { }` only to start async work from a synchronous context; it inherits the enclosing actor.
-
-## SwiftUI app and scene architecture for tvOS
-
-A tvOS app is a plain SwiftUI lifecycle app. There is no `AppDelegate` requirement.
-
-```swift
-import SwiftUI
-
-@main
-struct LivingRoomApp: App {
-    var body: some Scene {
-        WindowGroup {
-            RootView()
-        }
-    }
-}
-```
-
-Top-level navigation on tvOS is a **`TabView`** rendered as a top tab bar, or a sidebar via `.tabViewStyle(.sidebarAdaptable)` (tvOS 18+). Give each tab its own `NavigationStack` so navigation history is per-section and the tab bar persists:
-
-```swift
-struct RootView: View {
-    var body: some View {
-        TabView {
-            Tab("Home", systemImage: "house") {
-                NavigationStack { HomeView() }
-            }
-            Tab("Movies", systemImage: "film") {
-                NavigationStack { CatalogView(kind: .movies) }
-            }
-            Tab("Search", systemImage: "magnifyingglass") {
-                NavigationStack { SearchView() }
-            }
-        }
-    }
-}
-```
-
-Use **`NavigationStack`** with value-based destinations — never the deprecated `NavigationView`, and never `NavigationSplitView` with the default/prominent detail style on tvOS (it has a long-standing bug where the content column fails to render; if you must, force `.navigationSplitViewStyle(.balanced)`).
-
-```swift
-struct CatalogView: View {
-    let kind: CatalogKind
-    @State private var items: [Title] = []
-
-    var body: some View {
-        ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(320), spacing: 40), count: 5),
-                      spacing: 60) {
-                ForEach(items) { title in
-                    NavigationLink(value: title) { PosterCard(title: title) }
-                        .buttonStyle(.card)
-                }
-            }
-            .padding(EdgeInsets(top: 60, leading: 80, bottom: 60, trailing: 80)) // overscan-safe
-        }
-        .navigationDestination(for: Title.self) { DetailView(title: $0) }
-    }
-}
-```
-
-tvOS 26 adopts Apple's **Liquid Glass** design (WWDC 2025) — shared APIs like `.glassEffect(.regular, in: .capsule)`, `.buttonStyle(.glass)`, and `GlassEffectContainer` are available. Critical hardware caveat: the Liquid Glass redesign is only rendered on **Apple TV 4K (2nd generation and later)**; Apple TV HD and the 1st-gen Apple TV 4K run tvOS 26 but do not get the redesign. Do not assume glass visuals exist on all supported hardware.
-
-## The tvOS focus engine
-
-Focus is the whole game on tvOS. The engine picks the next focusable view by geometry (it traces from the *center* of the currently focused view), hierarchy, and your declared structure. Learn the vocabulary and cooperate with it.
-
-`@FocusState` (tvOS 15+) tracks and programmatically drives focus. Always make it an `Optional` or `Bool`:
-
-```swift
-struct LoginView: View {
-    enum Field: Hashable { case email, password, submit }
-    @FocusState private var focus: Field?
-    @State private var email = ""
-    @State private var password = ""
-
-    var body: some View {
-        VStack(spacing: 40) {
-            TextField("Email", text: $email).focused($focus, equals: .email)
-            SecureField("Password", text: $password).focused($focus, equals: .password)
-            Button("Sign In") { submit() }.focused($focus, equals: .submit)
-        }
-        .onAppear { focus = .email }        // set initial focus
-        .onSubmit { focus = .password }     // move focus on submit
-    }
-}
-```
-
-**`focusSection()`** is the single most important tvOS focus modifier and the one agents omit. It groups focusable descendants into one target so the engine can jump between non-adjacent regions (e.g. from a left sidebar list to a right-side content grid) that pure geometry would otherwise skip. Apply it to each logical cluster — a sidebar, a button row, a card shelf:
-
-```swift
-HStack(spacing: 0) {
-    SeasonSidebar(seasons: seasons, selection: $selectedSeason)
-        .frame(width: 360)
-        .focusSection()          // sidebar is one focus target
-
-    EpisodeGrid(episodes: episodes)
-        .focusSection()          // grid is another; focus can now cross the gap
-}
-```
-
-`focusable()` makes an otherwise non-interactive view focusable (an `Image`, a custom card). `prefersDefaultFocus(_:in:)` paired with `@Namespace` and `focusScope(_:)` declares which view grabs focus by default within a scope. `focusEffectDisabled()` opts out of the system focus effect when you draw your own.
-
-```swift
-struct Shelf: View {
-    @Namespace private var shelf
-    var body: some View {
-        ScrollView(.horizontal) {
-            LazyHStack {
-                ForEach(titles) { t in
-                    PosterCard(title: t)
-                        .prefersDefaultFocus(t == titles.first, in: shelf)
-                }
-            }
-        }
-        .focusScope(shelf)
-    }
-}
-```
-
-Respond to remote input with intent-based modifiers, not gestures. **`onMoveCommand`** reports directional swipes on the Siri Remote; **`onExitCommand`** handles the Menu/Back button (use it to dismiss custom overlays):
-
-```swift
-CustomOverlay()
-    .onMoveCommand { direction in
-        switch direction {
-        case .left:  selectPrevious()
-        case .right: selectNext()
-        default: break
-        }
-    }
-    .onExitCommand { dismissOverlay() }   // Menu button
-```
-
-Read whether the current view is focused with the `isFocused` environment value (or `.focused` state) to drive appearance:
-
-```swift
-struct PosterCard: View {
-    let title: Title
-    @Environment(\.isFocused) private var isFocused
-    var body: some View {
-        Image(title.poster)
-            .scaleEffect(isFocused ? 1.1 : 1.0)
-            .animation(.easeOut(duration: 0.2), value: isFocused)
-    }
-}
-```
-
-## Button styles and card interactions
-
-Use **`.buttonStyle(.card)`** (`CardButtonStyle`, tvOS 14+) for content tiles. It handles the focus lift/raise and the directional parallax motion when the user drags on the Siri Remote — the native "TV feel" — with no code. It applies no padding and lets content go edge to edge.
-
-```swift
-Button { play(title) } label: {
-    VStack(alignment: .leading) {
-        Image(title.poster).resizable().aspectRatio(2/3, contentMode: .fit)
-        Text(title.name).font(.caption)
-    }
-}
-.buttonStyle(.card)
-```
-
-Do **not** use `.hoverEffect(.lift)` as your interaction model — hover effects are a pointer-device concept (iPadOS/macOS); on tvOS the *focus* engine provides the lift. Use `.buttonStyle(.card)` or `.borderedProminent` for standard buttons, and `.bordered`/`.plain` where appropriate. Context menus work on tvOS via long-press (hold Select):
-
-```swift
-PosterCard(title: title)
-    .contextMenu {
-        Button("Add to Watchlist") { add(title) }
-        Button("Mark as Watched") { markWatched(title) }
-    }
-```
-
-## AVFoundation and AVKit playback
-
-For full-screen video, use **`AVPlayerViewController`** (from AVKit), not a hand-rolled `AVPlayer` + `AVPlayerLayer`. Apple explicitly recommends it for tvOS: it provides the transport bar, Info panel, subtitle/audio selection, chapter navigation, and interstitial UI for free. Wrap it for SwiftUI:
-
-```swift
-import SwiftUI
-import AVKit
-
-struct PlayerView: UIViewControllerRepresentable {
-    let player: AVPlayer
-
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let vc = AVPlayerViewController()
-        vc.player = player
-        return vc
-    }
-    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {}
-}
-```
-
-For a modern content pipeline, build the item from an `AVURLAsset` and load properties asynchronously (`AVAsset` synchronous property access is deprecated — use `load(_:)`):
-
-```swift
-func makePlayerItem(url: URL) async throws -> AVPlayerItem {
-    let asset = AVURLAsset(url: url)
-    _ = try await asset.load(.isPlayable, .duration)
-    return AVPlayerItem(asset: asset)
-}
-```
-
-**Interstitials (ads):** on tvOS, set `AVPlayerItem.interstitialTimeRanges` (or let them be synthesized from HLS `EXT-X-DATERANGE`). AVKit draws dots on the timeline and calls the delegate as playback enters/exits each range — use this to enforce business rules or capture analytics:
-
-```swift
-final class PlaybackCoordinator: NSObject, AVPlayerViewControllerDelegate {
-    func playerViewController(_ pvc: AVPlayerViewController,
-                             willPresent interstitial: AVInterstitialTimeRange) {
-        pvc.requiresLinearPlayback = true   // block scrubbing during the ad
-    }
-    func playerViewController(_ pvc: AVPlayerViewController,
-                             didPresent interstitial: AVInterstitialTimeRange) {
-        pvc.requiresLinearPlayback = false
-    }
-}
-```
-
-Critical gotcha: **`requiresLinearPlayback` is the only API that disables the ±10s skip** on the Siri Remote. `isSkipForwardEnabled`/`isSkipBackwardEnabled` only affect non-default skipping behaviors and will NOT stop scrubbing — agents reach for them and are surprised.
-
-Customize the transport bar with `transportBarCustomMenuItems` (add `UIMenu`/`UIAction` entries) and supply metadata via `AVPlayerItem.externalMetadata` and chapter markers via `navigationMarkerGroups`.
-
-**Now Playing / background audio:** for audio-only or PiP-continued playback, configure the audio session and populate the Now Playing info + remote commands. On tvOS the audio category enables background audio:
-
-```swift
-import AVFAudio
-import MediaPlayer
-
-try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-try AVAudioSession.sharedInstance().setActive(true)
-
-let center = MPRemoteCommandCenter.shared()
-center.playCommand.addTarget { _ in player.play(); return .success }
-center.pauseCommand.addTarget { _ in player.pause(); return .success }
-
-MPNowPlayingInfoCenter.default().nowPlayingInfo = [
-    MPMediaItemPropertyTitle: title.name,
-    MPMediaItemPropertyPlaybackDuration: title.duration,
-    MPNowPlayingInfoPropertyElapsedPlaybackTime: 0
-]
-```
-
-Requires the **Audio, AirPlay, and Picture in Picture** background mode in the target's capabilities/Info.plist (`UIBackgroundModes` → `audio`).
-
-## FairPlay Streaming and HLS key delivery
-
-Use **`AVContentKeySession`** (the modern API, since iOS/tvOS 11) for FairPlay, not the older `AVAssetResourceLoaderDelegate` path. `AVContentKeySession` decouples key loading from the playback lifecycle and is the recommended approach for new code; the resource-loader path is the legacy pattern agents copy from old blog posts.
-
-```swift
-import AVFoundation
-
-final class ContentKeyManager: NSObject, AVContentKeySessionDelegate {
-    let session = AVContentKeySession(keySystem: .fairPlayStreaming)
-    private let queue = DispatchQueue(label: "com.example.fairplay")
-
-    override init() {
-        super.init()
-        session.setDelegate(self, queue: queue)
-    }
-
-    func prepareToPlay(_ asset: AVURLAsset) {
-        session.addContentKeyRecipient(asset)
-    }
-
-    func contentKeySession(_ session: AVContentKeySession,
-                           didProvide keyRequest: AVContentKeyRequest) {
-        Task { await handle(keyRequest) }
-    }
-
-    private func handle(_ keyRequest: AVContentKeyRequest) async {
-        do {
-            let contentID = (keyRequest.identifier as? String) ?? ""
-            let idData = Data(contentID.utf8)
-            let appCert = try await fetchApplicationCertificate()
-            let spc = try await keyRequest.makeStreamingContentKeyRequestData(
-                forApp: appCert, contentIdentifier: idData)
-            let ckc = try await fetchContentKey(spc: spc, contentID: contentID) // your KSM
-            let response = AVContentKeyResponse(fairPlayStreamingKeyResponseData: ckc)
-            keyRequest.processContentKeyResponse(response)
-        } catch {
-            keyRequest.processContentKeyResponseError(error)
-        }
-    }
-}
-```
-
-For offline/persistent keys, respond to `AVPersistableContentKeyRequest` and store the result of `persistableContentKey(fromKeyVendorResponse:)`. Gotcha: **do not reuse one `AVContentKeySession` across rapid channel changes** — Apple documents against reuse, and rapid tune-ins cause stale key requests to arrive for a superseded asset. Also, calling `processContentKeyRequest` twice with the same identifier will not re-fire the delegate.
-
-Picture in Picture on tvOS: set `AVPlayerViewController.allowsPictureInPicturePlayback = true`. FairPlay content plays over AirPlay out of the box when keys come via the resource-loader path; behavior differs for `AVContentKeySession` (check `canProvidePersistableContentKey` before using a persistent key for AirPlay).
-
-## Top shelf extension
-
-Use the modern **`TVTopShelfContentProvider`** (subclass it), not the deprecated `TVTopShelfProvider` protocol. Add a **TV Top Shelf Extension** target. There are four content styles: `TVTopShelfCarouselContent` (full-screen art/video, the richest), `TVTopShelfSectionedContent`, `TVTopShelfInsetContent`, and details carousel.
-
-```swift
-import TVServices
-
-final class ContentProvider: TVTopShelfContentProvider {
-    override func loadTopShelfContent(
-        completionHandler: @escaping (TVTopShelfContent?) -> Void
-    ) {
-        Task {
-            let featured = try? await MoviesClient.shared.featured()
-            guard let featured else { completionHandler(nil); return }
-
-            let items = featured.map { movie -> TVTopShelfSectionedItem in
-                let item = TVTopShelfSectionedItem(identifier: movie.id)
-                item.title = movie.name
-                item.setImageURL(movie.posterURL, for: .screenScale2x)
-                item.displayAction = TVTopShelfAction(
-                    url: URL(string: "livingroom://title/\(movie.id)")!)
-                return item
-            }
-            let collection = TVTopShelfItemCollection(items: items)
-            collection.title = "Featured"
-            completionHandler(TVTopShelfSectionedContent(sections: [collection]))
-        }
-    }
-}
-```
-
-The extension's `Info.plist` must declare `NSExtensionPointIdentifier = com.apple.tv-top-shelf-provider` and `NSExtensionPrincipalClass = $(PRODUCT_MODULE_NAME).ContentProvider`. Deep-link URLs are handled in the main app via `.onOpenURL`. Call `TVTopShelfContentProvider.topShelfContentDidChange()` when your content updates. Keep the extension lightweight and share data with the app via an App Group.
-
-## SwiftPM: manifest, modularization, and binary targets
-
-Use `swift-tools-version` matching your toolchain floor. Set `defaultIsolation: MainActor` per target (SPM does not inherit the app's isolation) and enable strict concurrency features explicitly:
-
-```swift
-// swift-tools-version: 6.1
-import PackageDescription
-
-let package = Package(
-    name: "LivingRoomKit",
-    platforms: [.tvOS(.v26)],
-    products: [
-        .library(name: "CatalogFeature", targets: ["CatalogFeature"]),
-        .library(name: "PlaybackFeature", targets: ["PlaybackFeature"]),
-    ],
-    dependencies: [
-        .package(url: "https://github.com/example/rust-core-swift", from: "1.0.0"),
-    ],
-    targets: [
-        .target(
-            name: "CatalogFeature",
-            dependencies: ["DesignSystem"],
-            swiftSettings: [
-                .defaultIsolation(MainActor.self),          // match the app
-                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
-            ]
-        ),
-        .target(name: "DesignSystem"),
-        .target(
-            name: "PlaybackFeature",
-            dependencies: [
-                .product(name: "RustCore", package: "rust-core-swift"),
-            ]
-        ),
-        .testTarget(name: "CatalogFeatureTests", dependencies: ["CatalogFeature"]),
-    ]
-)
-```
-
-**Package traits** (SE-0450, "Package traits," review closed November 2024, shipped in Swift 6.1) let a package expose different feature sets per environment — Swift 6.1 added them to enable "different APIs and features for specific environments like Embedded Swift and WebAssembly." They require `swift-tools-version: 6.1` or higher (met by your 6.3 stack). Declare traits and a default set; a consumer enables them via `.package(..., traits:)`:
-
-```swift
-let package = Package(
-    name: "RustCore",
-    traits: [
-        "Telemetry",
-        .trait(name: "OfflineDownloads", enabledTraits: ["Telemetry"]),
-        .default(enabledTraits: ["Telemetry"]),
-    ],
-    // ...
-)
-
-// In the consumer — use .default (singular), matching the shipped API and the Swift.org 6.1 blog:
-.package(url: "https://github.com/example/rust-core-swift", from: "1.0.0",
-         traits: [.default, "OfflineDownloads"])
-```
-
-Guard trait-gated code with plain `#if TraitName`. Traits must be additive (enabling one never removes API); removing a default trait is a SemVer-breaking change. Empty `traits: []` disables all traits including defaults.
-
-**Binary targets** distribute a precompiled XCFramework (see UniFFI below). Reference remotely by URL+checksum, or locally by path during development:
-
-```swift
-.binaryTarget(
-    name: "RustCoreFFI",
-    url: "https://github.com/example/rust-core-swift/releases/download/1.0.0/RustCoreFFI.xcframework.zip",
-    checksum: "a1b2c3..." // swift package compute-checksum RustCoreFFI.xcframework.zip
-),
-// or local:
-.binaryTarget(name: "RustCoreFFI", path: "./Artifacts/RustCoreFFI.xcframework"),
-```
-
-Bundle resources with `.process("Resources")` or `.copy(...)`; access via `Bundle.module`. Prefer SwiftPM for all dependencies — **not** CocoaPods or Carthage, which are legacy for this stack.
-
-## XcodeGen project.yml
-
-XcodeGen generates the `.xcodeproj` from a checked-in `project.yml`, eliminating merge conflicts. Prefer it over Tuist for this stack unless you need Tuist's caching/generation graph. Regenerate with `xcodegen generate`; do not commit the `.xcodeproj`. A tvOS app with a top shelf extension and local package:
+`project.yml` is the single source of truth; the `.xcodeproj` is generated and git-ignored. Run `xcodegen generate` after any change to the spec or after adding files. Set the Swift 6 language mode and approachable-concurrency build settings here so they apply to the app target uniformly.
 
 ```yaml
+# project.yml
 name: LivingRoom
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.example.livingroom
   deploymentTarget:
-    tvOS: "26.0"
+    tvOS: "18.0"
   createIntermediateGroups: true
-
-packages:
-  LivingRoomKit:
-    path: ./LivingRoomKit
+  xcodeVersion: "26.4"
 
 settings:
   base:
-    SWIFT_VERSION: "6.0"
+    SWIFT_VERSION: "6.0"                       # language mode, not toolchain
     SWIFT_STRICT_CONCURRENCY: complete
-    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    SWIFT_APPROACHABLE_CONCURRENCY: "YES"
     SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    TVOS_DEPLOYMENT_TARGET: "18.0"
+    TARGETED_DEVICE_FAMILY: "3"                # 3 = Apple TV
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+
+packages:
+  LivingRoomCore:
+    path: LivingRoomCore                       # local SwiftPM package (Rust core + wrappers)
+  SwiftLintPlugins:
+    url: https://github.com/SimplyDanny/SwiftLintPlugins
+    from: "0.65.1"
 
 targets:
   LivingRoom:
     type: application
     platform: tvOS
-    sources: [Sources/App]
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.example.livingroom
-      TARGETED_DEVICE_FAMILY: "3"      # 3 = Apple TV
-    info:
-      path: Sources/App/Info.plist
-      properties:
-        UILaunchScreen: {}
+      base:
+        INFOPLIST_FILE: Sources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.livingroom.app
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
     dependencies:
-      - package: LivingRoomKit
-        product: CatalogFeature
-      - package: LivingRoomKit
-        product: PlaybackFeature
-      - target: TopShelf
+      - package: LivingRoomCore
+        product: LivingRoomCore
+    buildToolPlugins:
+      - plugin: SwiftLintBuildToolPlugin
+        package: SwiftLintPlugins
+    scheme:
+      testTargets:
+        - LivingRoomTests
+      gatherCoverageData: true
 
-  TopShelf:
-    type: tv-app-extension
+  LivingRoomTests:
+    type: bundle.unit-test
     platform: tvOS
-    sources: [Sources/TopShelf]
-    settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.example.livingroom.topshelf
-    info:
-      path: Sources/TopShelf/Info.plist
-      properties:
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.tv-top-shelf-provider
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ContentProvider
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: LivingRoom
 ```
 
-`TARGETED_DEVICE_FAMILY = 3` is the Apple TV device family. Use `supportedDestinations`/`destinationFilters` if a target spans platforms.
+`TARGETED_DEVICE_FAMILY: "3"` is the tvOS device family; omitting it is a common cause of "unsupported destination" build failures. Keep exact tool versions in the `packages:` block and the version table, not scattered through prose.
 
-## UniFFI: wrapping a Rust core safely
+## Swift Package manifest and module layout
 
-UniFFI (`mozilla/uniffi-rs`) generates idiomatic Swift bindings from a Rust crate. Use UniFFI for a shared Rust core exposing a defined API surface; `swift-bridge` is the alternative and is better for tight, hand-tuned Swift↔Rust interop, but UniFFI is the right default for a portable core shared with Android. The workflow: build the Rust static lib for each Apple arch, generate Swift with `uniffi-bindgen-swift` (library mode), assemble an XCFramework, and wrap it in a SwiftPM package.
+The app's logic lives in a local SwiftPM package that also hosts the Rust core as a binary target. A newly created SwiftPM package does **not** inherit the app's main-actor default or approachable-concurrency flags — you must set them per target. Set `defaultIsolation` for UI-facing targets; leave a pure networking or core-logic target `nonisolated` if it is genuinely off-main.
 
-Add a bindgen binary to the Rust crate:
+```swift
+// swift-tools-version: 6.3
+import PackageDescription
+
+let package = Package(
+    name: "LivingRoomCore",
+    platforms: [.tvOS(.v18)],
+    products: [
+        .library(name: "LivingRoomCore", targets: ["LivingRoomCore"]),
+    ],
+    targets: [
+        // Prebuilt Rust core, packaged as an XCFramework (see UniFFI section).
+        .binaryTarget(
+            name: "RustCoreFFI",
+            path: "Artifacts/RustCoreFFI.xcframework"
+        ),
+        // Generated UniFFI Swift bindings; kept nonisolated because the Rust
+        // core is not tied to the main actor.
+        .target(
+            name: "RustCore",
+            dependencies: ["RustCoreFFI"],
+            path: "Sources/RustCore",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        // UI-facing view models and helpers default to the main actor.
+        .target(
+            name: "LivingRoomCore",
+            dependencies: ["RustCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .defaultIsolation(MainActor.self),
+            ]
+        ),
+        .testTarget(
+            name: "LivingRoomCoreTests",
+            dependencies: ["LivingRoomCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .defaultIsolation(MainActor.self),
+            ]
+        ),
+    ]
+)
+```
+
+`swift build` and `swift test` work for the pure-Swift and Rust-binding targets from the command line, but anything that links UIKit/AVKit/SwiftUI for the tvOS SDK must be built and tested through `xcodebuild` with a tvOS destination — `swift test` on the host macOS cannot run tvOS-only code.
+
+## Concurrency: main-actor by default, escape on purpose
+
+Under approachable concurrency the mental model inverts: **everything is `@MainActor` unless you say otherwise**, and you prove only the few places you leave the main actor. Three rules cover almost every case:
+
+- Leave UI types, view models, and view code implicit (they are main-actor by default).
+- Mark CPU-bound or blocking work `@concurrent` to push it to the global executor. A bare `nonisolated async` function no longer hops to the background — it runs on the *caller's* actor (`nonisolated(nonsending)`), so `@concurrent` is now the explicit escape hatch.
+- Use an `actor` for mutable state that is shared across tasks and is genuinely off-main, such as a playback-session coordinator.
+
+```swift
+import Foundation
+
+// Main-actor by default (module default isolation). No annotation needed.
+@Observable
+final class CatalogViewModel {
+    private(set) var rows: [Shelf] = []
+    private(set) var loadState: LoadState = .idle
+
+    enum LoadState: Equatable { case idle, loading, loaded, failed(String) }
+
+    private let core: CatalogService   // from the Rust core, async API
+
+    init(core: CatalogService) { self.core = core }
+
+    func load() async {
+        loadState = .loading
+        do {
+            // `core.fetchShelves()` is async; awaiting it does not block the
+            // main actor. Decoding/sorting heavy work lives behind @concurrent.
+            let fetched = try await core.fetchShelves()
+            rows = try await Self.sort(fetched)
+            loadState = .loaded
+        } catch is CancellationError {
+            loadState = .idle                 // task was cancelled; not an error
+        } catch {
+            loadState = .failed(String(describing: error))
+        }
+    }
+
+    // Deliberately off-main: sorting a large catalog should not touch the UI thread.
+    @concurrent
+    private static func sort(_ shelves: [Shelf]) async throws -> [Shelf] {
+        try Task.checkCancellation()
+        return shelves.sorted { $0.rank < $1.rank }
+    }
+}
+```
+
+Never spin up a `Task.detached` just to "get off the main thread" — it discards actor context and priority. Prefer `@concurrent` functions or an actor. Reserve `Task.detached` for the rare case where you explicitly want no inherited context.
+
+## SwiftUI for the living room
+
+tvOS UI is built around the **focus engine**, not touch. There are no tap targets; the user moves focus with the Siri Remote and selects. Design every screen so focus can travel in straight horizontal/vertical lines, and group related controls with `focusSection` when their geometry would otherwise strand focus.
+
+### Focus, navigation, and the remote
+
+```swift
+import SwiftUI
+
+struct HomeView: View {
+    @State private var model: CatalogViewModel
+    @FocusState private var focusedShelf: Shelf.ID?
+
+    init(model: CatalogViewModel) { _model = State(initialValue: model) }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 48) {
+                    ForEach(model.rows) { shelf in
+                        ShelfRow(shelf: shelf)
+                            .focusSection()               // keep focus inside the row
+                            .focused($focusedShelf, equals: shelf.id)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.viewAligned)
+            .task { await model.load() }                   // auto-cancels on disappear
+            .onExitCommand {                                // Menu button on the remote
+                focusedShelf = model.rows.first?.id
+            }
+        }
+    }
+}
+
+struct ShelfRow: View {
+    let shelf: Shelf
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(shelf.title).font(.headline)
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 40) {
+                    ForEach(shelf.items) { item in
+                        NavigationLink(value: item) {
+                            PosterCard(item: item)
+                        }
+                        .buttonStyle(.card)                 // tvOS focus lift + parallax
+                    }
+                }
+                .scrollTargetLayout()
+            }
+        }
+    }
+}
+```
+
+Key tvOS specifics:
+
+- `.buttonStyle(.card)` gives the native focus lift and parallax for poster art; `.borderless` is the default text-button treatment. Do not hand-build focus scaling with `scaleEffect` — the system does it correctly and consistently.
+- `.task` ties an async load to the view's lifetime and cancels automatically when the view disappears; handle `CancellationError` as a non-error.
+- `onExitCommand` handles the Menu button, `onPlayPauseCommand` the Play/Pause button, and `onMoveCommand` directional swipes when you need raw input (rare — prefer focus-driven navigation).
+- Use `defaultFocus(_:_:)` to place initial focus on the most likely control; without it, focus can land unpredictably.
+
+### TabView and sidebars
+
+On tvOS 18 the collapsible sidebar is available with `.tabViewStyle(.sidebarAdaptable)` on a `TabView` built from the `Tab`/`TabSection` API. There is a verified behavioral gotcha: with more than seven tabs, or when `TabSection` groups are present, the remote's back-swipe may fail to reveal the collapsed sidebar. Keep primary tabs at seven or fewer and test sidebar reveal when you introduce sections.
+
+```swift
+struct RootView: View {
+    var body: some View {
+        TabView {
+            Tab("Home", systemImage: "house") { HomeView(model: .live) }
+            Tab("Movies", systemImage: "film") { MoviesView() }
+            Tab("Search", systemImage: "magnifyingglass", role: .search) { SearchView() }
+        }
+        .tabViewStyle(.sidebarAdaptable)
+    }
+}
+```
+
+What to avoid from the phone playbook: swipe/drag gestures, `.sheet`/`.popover` as primary navigation (present full-screen `NavigationStack` destinations instead), and dense `TextField` forms — text entry on tvOS routes through the system keyboard and should be minimized. Account for **overscan**: respect the safe area and never place essential content at the extreme screen edges.
+
+## Video playback with AVKit
+
+Two integration paths, pick by need:
+
+- **`VideoPlayer` (SwiftUI):** the fastest path for simple playback. It renders an `AVPlayer` inline but exposes almost no transport-bar customization.
+- **`AVPlayerViewController` via `UIViewControllerRepresentable`:** required for tvOS transport-bar customization (`transportBarCustomMenuItems`, `contextualActions`, `infoViewActions`, `customInfoViewControllers`), interstitials, and fine control. This is the default for a real media app.
+
+```swift
+import SwiftUI
+import AVKit
+
+struct PlayerScreen: UIViewControllerRepresentable {
+    let player: AVPlayer
+    let customMenu: [UIMenuElement]
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.transportBarCustomMenuItems = customMenu
+        controller.allowsPictureInPicturePlayback = true
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        controller.transportBarCustomMenuItems = customMenu
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {}
+}
+```
+
+### Owning player state with an actor and observing time safely
+
+`AVPlayer`'s periodic time observer and KVO must be *removed by the same owner that added them*, on the same object, before the player is torn down or its item is replaced — failure to do so is a well-documented crash on tvOS. Wrap observation in an `AsyncStream` whose `onTermination` handler removes the observer, so cancellation and cleanup are one path.
+
+```swift
+import AVFoundation
+
+@MainActor
+final class PlaybackController {
+    let player = AVPlayer()
+    private var timeObserver: Any?
+
+    /// Emits the current playback time roughly twice a second. The observer is
+    /// installed when iteration begins and removed when the stream terminates
+    /// (consumer cancels, or the task is cancelled).
+    func times() -> AsyncStream<CMTime> {
+        AsyncStream { continuation in
+            let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let token = player.addPeriodicTimeObserver(
+                forInterval: interval, queue: .main
+            ) { time in
+                continuation.yield(time)
+            }
+            self.timeObserver = token
+            continuation.onTermination = { [weak self] _ in
+                // Hop back to the main actor to remove the observer safely.
+                Task { @MainActor in self?.removeTimeObserver() }
+            }
+        }
+    }
+
+    private func removeTimeObserver() {
+        if let token = timeObserver {
+            player.removeTimeObserver(token)
+            timeObserver = nil
+        }
+    }
+
+    func replaceItem(with item: AVPlayerItem) {
+        // Remove observers BEFORE swapping the item to avoid KVO teardown crashes.
+        removeTimeObserver()
+        player.replaceCurrentItem(with: item)
+    }
+
+    deinit { /* AVPlayer released; token invalidated with it. */ }
+}
+```
+
+For observing item status prefer `AVPlayerItem.publisher(for:)` bridged to `.values`, but attach it to the item you actually keep a reference to; a `publisher(for:)` on `AVPlayer`'s `currentItem` keypath can silently stop delivering after `replaceCurrentItem`.
+
+### HLS, DRM, audio, and background policy
+
+- HLS is the delivery format; for protected content use FairPlay via `AVContentKeySession`. The key exchange below is an excerpt — the certificate and CKC come from your license server.
+
+```swift
+// Excerpt — license-server calls omitted.
+import AVFoundation
+
+final class ContentKeyManager: NSObject, AVContentKeySessionDelegate {
+    let session = AVContentKeySession(keySystem: .fairPlayStreaming)
+
+    func attach(to asset: AVURLAsset) {
+        session.setDelegate(self, queue: .main)
+        session.addContentKeyRecipient(asset)
+    }
+
+    func contentKeySession(_ session: AVContentKeySession,
+                           didProvide request: AVContentKeyRequest) {
+        // 1. fetch app certificate, 2. request.makeStreamingContentKeyRequestData,
+        // 3. POST SPC to license server, 4. respond with AVContentKeyResponse(fairPlayStreamingKeyResponseData:).
+    }
+}
+```
+
+- Set an `AVAudioSession` category of `.playback` on tvOS so audio behaves correctly and continues appropriately; do this once before playback starts.
+- Picture in Picture is available on tvOS via `allowsPictureInPicturePlayback`; use `AVPlayer.audiovisualBackgroundPlaybackPolicy` to express whether playback should continue when the app is backgrounded.
+- Surface item and player errors from `AVPlayerItem.status == .failed` (read `item.error`) and from `AVPlayer.error`; do not assume a URL that loads in the simulator streams on device.
+
+## The Rust core via UniFFI
+
+The Rust core is compiled to static libraries, wrapped by UniFFI-generated Swift, and shipped as an XCFramework binary target. As of the current release, `aarch64-apple-tvos` (device) and `aarch64-apple-tvos-sim` (Apple-silicon simulator) are Tier 2 Rust targets (without host tools) distributed through `rustup` — you can `rustup target add` them and build with stable Cargo, no nightly `-Zbuild-std` required. Only the legacy `x86_64-apple-tvos` Intel simulator remains Tier 3 and would need a `-Zbuild-std` build. App Store submissions require bitcode-free static frameworks, which is what this pipeline produces.
+
+Prefer **proc-macro** bindings (`#[uniffi::export]`, `uniffi::setup_scaffolding!()`) over the older UDL file; it needs no separate interface definition and is what `uniffi-bindgen-swift` operates on in library mode.
 
 ```rust
-// src/bin/uniffi-bindgen.rs
-fn main() { uniffi::uniffi_bindgen_swift() }
+// src/lib.rs
+uniffi::setup_scaffolding!();
+
+#[derive(uniffi::Record)]
+pub struct Shelf { pub id: String, pub title: String, pub rank: u32 }
+
+#[derive(uniffi::Error, Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("network unavailable")]
+    Network,
+    #[error("decode failed: {msg}")]
+    Decode { msg: String },
+}
+
+#[derive(uniffi::Object)]
+pub struct CatalogService { /* ... */ }
+
+#[uniffi::export]
+impl CatalogService {
+    #[uniffi::constructor]
+    pub fn new() -> Self { Self { /* ... */ } }
+
+    // async fn surfaces as Swift `async throws`, driven by Swift's executor.
+    pub async fn fetch_shelves(&self) -> Result<Vec<Shelf>, CatalogError> {
+        Ok(vec![])
+    }
+}
 ```
 
-Build, generate bindings, and package (build script sketch):
+Build and package (device + arm64 simulator):
 
 ```bash
-# Build for device + simulator (Apple Silicon)
+# One-time
+rustup target add aarch64-apple-tvos aarch64-apple-tvos-sim
+
+# Build static libs
 cargo build --release --target aarch64-apple-tvos
 cargo build --release --target aarch64-apple-tvos-sim
 
-# Generate Swift sources, headers, and modulemap in library mode
-cargo run --bin uniffi-bindgen -- generate \
-  --library target/aarch64-apple-tvos/release/librustcore.a \
-  --language swift --out-dir bindings
+# Generate Swift bindings, headers, and an XCFramework-compatible modulemap
+cargo run -p uniffi-bindgen-swift -- \
+  target/aarch64-apple-tvos/release/librust_core.a \
+  Generated \
+  --swift-sources --headers --modulemap \
+  --module-name RustCoreFFI --modulemap-filename module.modulemap
 
-# module.modulemap must be renamed exactly (easy to miss)
-mv bindings/RustCoreFFI.modulemap bindings/module.modulemap
-
-# Assemble the XCFramework
+# Assemble the XCFramework consumed by the SwiftPM binary target
 xcodebuild -create-xcframework \
-  -library target/aarch64-apple-tvos/release/librustcore.a -headers bindings \
-  -library target/aarch64-apple-tvos-sim/release/librustcore.a -headers bindings \
-  -output RustCoreFFI.xcframework
+  -library target/aarch64-apple-tvos/release/librust_core.a -headers Generated \
+  -library target/aarch64-apple-tvos-sim/release/librust_core.a -headers Generated \
+  -output Artifacts/RustCoreFFI.xcframework
 ```
 
-The Swift package has three layers: the `binaryTarget` (the XCFramework), a target holding the generated `.swift` files that links it, and an idiomatic Swift overlay:
+Move the generated `*.swift` into the `RustCore` SwiftPM target's sources; keep the `module.modulemap` and header inside the XCFramework's header directory. The generated modulemap must be named `module.modulemap` or Swift will not find the module.
+
+**Sendable across the boundary is the sharpest gotcha.** UniFFI has partial Swift 6 support: most generated types conform to `Sendable`, but async-returning generated code is known *not* to conform yet (tracked upstream). Do not paper over this with `@unchecked Sendable` on generated types — regenerate against a current UniFFI, and where an async Rust object triggers a "sending self-isolated value" error, confine that object to a single actor (e.g. hold it inside a `@MainActor` view model, or an `actor`) rather than passing it across isolation domains. When you implement a UniFFI foreign trait (callback interface) in Swift, the generated protocol requires `Sendable`, so your implementation must genuinely be safe to call from any thread. Async Rust functions surface as Swift `async` and are cancellable through normal Swift `Task` cancellation.
+
+## Data and persistence
+
+Networking is `URLSession`'s async API with `Codable`; do not add a third-party HTTP client without a concrete need.
 
 ```swift
-.target(
-    name: "RustCore",
-    dependencies: ["RustCoreFFI"]   // generated bindings + binary
-),
-.binaryTarget(name: "RustCoreFFI", path: "./RustCoreFFI.xcframework"),
-```
+struct FeedClient {
+    let session: URLSession = .shared
 
-Concurrency is where agents get UniFFI wrong. Generated types are reference types backed by Rust; **do not assume they are `Sendable`**. Treat them as isolated and wrap access in an actor, converting to your own `Sendable` Swift models at the boundary:
-
-```swift
-import RustCore
-
-// Rust-owned handle; confine it to an actor.
-actor CoreEngine {
-    private let inner = RustCore.Engine()          // generated type, not Sendable
-
-    func recommendations(for profile: String) throws -> [Recommendation] {
-        // Map generated types into your own Sendable structs before returning.
-        try inner.recommend(profile: profile).map(Recommendation.init(core:))
-    }
-}
-
-struct Recommendation: Sendable, Identifiable {
-    let id: String
-    let title: String
-    init(core: RustCore.Recommendation) {
-        self.id = core.id
-        self.title = core.title
+    func shelves(from url: URL) async throws -> [ShelfDTO] {
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return try JSONDecoder().decode([ShelfDTO].self, from: data)
     }
 }
 ```
 
-Map Rust `Result`/errors: UniFFI generates a Swift `Error`-conforming enum for each Rust error type; catch it and translate to your domain error. UniFFI uses `Arc` for shared ownership, so passing a handle into Rust and back is cheap, but every call crosses the FFI — batch calls rather than looping across the boundary per item.
+**tvOS storage is severely constrained and this drives architecture.** There is no persistent `Documents` directory. Only the `Caches` and `tmp` directories are writable, and the system may purge them at any time while the app is not running — never treat cached files as durable. `UserDefaults` is the only local persistent store and per Apple's App Programming Guide for tvOS your app "can only access 500 KB of persistent storage that is local to the device (using the `NSUserDefaults` class)"; the system posts `sizeLimitExceededNotification` as a warning at 512 KB and **terminates the app** once user-defaults storage reaches 1 MB. Use it for small preferences only; the app bundle is read-only. For anything larger or that must survive, use iCloud key-value store (`NSUbiquitousKeyValueStore`) or CloudKit / your own backend, and keep secrets in the Keychain. Design the app to re-fetch or re-derive anything it stores locally.
 
-## Testing: Swift Testing and XCUITest
+## Linting and formatting
 
-Use **Swift Testing** (`import Testing`, ships with Xcode 16+) for unit and logic tests. Tests are functions, suites are types, `#expect` and `#require` replace the 40+ `XCTAssert` variants, and tests run in parallel by default.
-
-```swift
-import Testing
-@testable import CatalogFeature
-
-@Suite("Catalog parsing")
-struct CatalogTests {
-    @Test func decodesFeatured() throws {
-        let json = Data(#"[{"id":"1","name":"Dune"}]"#.utf8)
-        let titles = try JSONDecoder().decode([Title].self, from: json)
-        let first = try #require(titles.first)   // stop the test if nil
-        #expect(first.name == "Dune")
-    }
-
-    @Test(arguments: [("movies", 5), ("shows", 3)])
-    func rowCount(kind: String, expected: Int) {
-        #expect(CatalogLayout(kind: kind).rowCount == expected)
-    }
-}
-```
-
-Each test in a suite gets a fresh instance; put setup in `init()` and teardown in `deinit`. Don't reach for `.serialized` when parallel tests fail — that almost always signals shared mutable state to fix. `@MainActor`-annotate a suite that touches UI-isolated code.
-
-Keep **XCUITest on XCTest** — Swift Testing does not cover UI automation or performance (`XCTMetric`). For tvOS UI tests, drive the focus engine via the remote (`XCUIRemote`):
-
-```swift
-import XCTest
-
-final class NavigationUITests: XCTestCase {
-    func testPlayFromHome() {
-        let app = XCUIApplication()
-        app.launch()
-        XCUIRemote.shared.press(.right)
-        XCUIRemote.shared.press(.select)
-        XCTAssertTrue(app.otherElements["PlayerView"].waitForExistence(timeout: 10))
-    }
-}
-```
-
-The two frameworks coexist in one target; never mix `#expect` into an `XCTestCase`.
-
-## SwiftLint
-
-Pin SwiftLint via SPM so every machine and CI runs the same version. The current release is **0.65.0** ("Fresh Folded Fixtures," 27 June 2026); it requires macOS 13+, and its SPM plugins work down to Swift 5.9 while the executable builds with a Swift 6 compiler. Run it as a **build tool plugin** for packages, but for the app target prefer an explicit Xcode **Run Script build phase** or a pre-commit hook — SPM build plugins can't do remote config and add clean-build cost. Never let SwiftLint run before compilation; it is designed to analyze compilable code.
-
-A practical `.swiftlint.yml`:
+Two complementary tools, both current defaults: **SwiftLint** for style/convention rules and **swift-format** (bundled with the toolchain, invoked as `swift format` with a space) for deterministic formatting. Prefer Apple's swift-format over the third-party SwiftFormat here — it ships with the toolchain and needs no extra dependency. Run SwiftLint as the SwiftPM `SwiftLintBuildToolPlugin` (from the SimplyDanny `SwiftLintPlugins` package, which keeps a pinned binary in sync with each SwiftLint release) so it lints on every build; fall back to a Run Script phase only if a setup requires `--config` across targets.
 
 ```yaml
-disabled_rules:
-  - todo
+# .swiftlint.yml
 opt_in_rules:
   - empty_count
   - first_where
-  - force_unwrapping
   - explicit_init
-  - redundant_type_annotation
-  - unused_import
-  - private_over_fileprivate
-  - sorted_imports
+  - toggle_bool
+  - unneeded_parentheses_in_closure_argument
 analyzer_rules:
   - unused_declaration
   - unused_import
-excluded:
-  - .build
-  - "**/*.generated.swift"   # UniFFI-generated bindings
-  - DerivedData
+disabled_rules:
+  - trailing_whitespace   # handled by swift-format
 line_length:
   warning: 120
   error: 200
-type_body_length: [300, 400]
+  ignores_comments: true
+  ignores_urls: true
 identifier_name:
-  min_length: 2
-  excluded: [id, x, y, vc]
+  min_length: { warning: 2 }
+  excluded: [id, x, y]
+included:
+  - Sources
+excluded:
+  - .build
+  - Generated               # do not lint UniFFI-generated Swift
 ```
 
-Run lint on every build/CI; run the slower analyzer separately against a build log:
-
-```bash
-swiftlint lint --strict
-xcodebuild -scheme LivingRoom clean build > build.log
-swiftlint analyze --compiler-log-path build.log
+```json
+// .swift-format
+{
+  "version": 1,
+  "lineLength": 120,
+  "indentation": { "spaces": 4 },
+  "maximumBlankLines": 1,
+  "respectsExistingLineBreaks": true,
+  "lineBreakBeforeEachArgument": true
+}
 ```
 
-Exclude the UniFFI-generated sources — linting machine-generated code is noise.
-
-## Build, run, and test commands
+Commands:
 
 ```bash
-# Generate the Xcode project
+swift format lint --strict --recursive Sources          # format check
+swift format --in-place --recursive Sources             # apply formatting
+swiftlint lint --strict                                  # style lint, warnings fail
+swiftlint analyze --strict                               # analyzer rules (needs a compile log)
+swiftlint --fix                                          # autocorrect fixable violations
+```
+
+Exclude the `Generated` UniFFI directory from both tools — machine-generated bindings should not be reformatted or linted. SwiftLint analyzes only compilable code, so run `--fix` on code that already builds.
+
+## Testing
+
+**Swift Testing** (`import Testing`) is the default for unit and logic tests; keep XCTest only where you still need `XCUIApplication` UI automation. Design for testability by injecting the Rust-backed services behind protocols so tests use fakes rather than the FFI.
+
+```swift
+import Testing
+@testable import LivingRoomCore
+
+@Suite("Catalog loading")
+struct CatalogTests {
+    @Test("Empty feed yields no shelves")
+    func emptyFeed() async throws {
+        let vm = CatalogViewModel(core: FakeCatalog(shelves: []))
+        await vm.load()
+        #expect(vm.rows.isEmpty)
+        #expect(vm.loadState == .loaded)
+    }
+
+    @Test("Shelves sort by rank", arguments: [
+        ([3, 1, 2], [1, 2, 3]),
+        ([1], [1]),
+    ])
+    func sorting(input: [UInt32], expected: [UInt32]) async throws {
+        let shelves = input.map { Shelf(id: "\($0)", title: "t", rank: $0) }
+        let vm = CatalogViewModel(core: FakeCatalog(shelves: shelves))
+        await vm.load()
+        #expect(vm.rows.map(\.rank) == expected)
+    }
+
+    @Test("Missing feed surfaces a failure")
+    func networkError() async throws {
+        let vm = CatalogViewModel(core: FailingCatalog())
+        await vm.load()
+        let failed = try #require(vm.loadState.failureMessage)
+        #expect(!failed.isEmpty)
+    }
+}
+```
+
+Use `#expect` for soft assertions (test continues) and `#require` for preconditions that must hold to proceed (throws and stops the test). Use `confirmation` for callback/event expectations, including `expectedCount: 0` to assert an event does *not* fire. Swift Testing runs tests in parallel by default, so keep them independent and free of shared mutable global state. Swift Testing 6.3 adds warning-severity issues (`Issue.record(_:severity:)`) and mid-test cancellation (`try Test.cancel()`) for skipping parameterized arguments.
+
+Run on a tvOS simulator:
+
+```bash
+xcodegen generate
+xcodebuild test \
+  -project LivingRoom.xcodeproj -scheme LivingRoom \
+  -destination 'platform=tvOS Simulator,name=Apple TV,OS=latest'
+```
+
+## CI commands
+
+One coherent pipeline, in order:
+
+```bash
+# 1. Build the Rust core and package the XCFramework
+rustup target add aarch64-apple-tvos aarch64-apple-tvos-sim
+cargo build --release --target aarch64-apple-tvos
+cargo build --release --target aarch64-apple-tvos-sim
+./scripts/make-xcframework.sh          # wraps uniffi-bindgen-swift + xcodebuild -create-xcframework
+
+# 2. Generate the Xcode project
 xcodegen generate
 
-# Build a package
-swift build
+# 3. Format + lint gates
+swift format lint --strict --recursive Sources
+swiftlint lint --strict
 
-# Build the app for the tvOS simulator
-xcodebuild -scheme LivingRoom \
-  -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
-  build
-
-# Run tests
-xcodebuild test -scheme LivingRoom \
-  -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)'
-
-# Compute a binary target checksum
-swift package compute-checksum RustCoreFFI.xcframework.zip
+# 4. Build and test on tvOS
+xcodebuild -project LivingRoom.xcodeproj -scheme LivingRoom \
+  -destination 'generic/platform=tvOS' build
+xcodebuild test -project LivingRoom.xcodeproj -scheme LivingRoom \
+  -destination 'platform=tvOS Simulator,name=Apple TV,OS=latest'
 ```
 
-## Performance and memory on Apple TV
-
-The Apple TV device is memory-constrained relative to its 4K output. Extensions (top shelf) run in a tight memory budget — keep them minimal. For catalog UIs:
-
-- Use `LazyVGrid`/`LazyHStack` inside `ScrollView` so off-screen cells aren't realized. A `VStack` of hundreds of posters will blow memory.
-- Downsample images to display size before handing them to SwiftUI — decoding full-resolution artwork for a 320pt card wastes megabytes each. Load remote posters at the target size.
-- Respect the **overscan-safe area**: per Apple's tvOS layout guidance, inset primary content by **60 points top and bottom and 80 points on the sides** so content isn't clipped on TVs that overscan.
-- Prefer a single `AVPlayer`/`AVPlayerViewController` and swap items; don't hold multiple decoded video pipelines alive.
-- Cap concurrent artwork prefetch; a shelf that eagerly loads 200 images stalls scrolling.
+Pin the Xcode version explicitly in CI; if the runner auto-updates, the local and CI toolchains diverge silently and concurrency diagnostics can differ.
 
 ## Anti-patterns to avoid
 
-| Wrong (iOS/adjacent habit) | Right (tvOS 26 / Swift 6) |
-| --- | --- |
-| `.onTapGesture { }` / `DragGesture()` for interaction | `Button` + focus engine; `onMoveCommand`/`onExitCommand` for remote |
-| `NavigationView` | `NavigationStack` with `navigationDestination` |
-| `.hoverEffect(.lift)` as the interaction | `.buttonStyle(.card)` — focus provides the lift |
-| Omitting `.focusSection()` on sidebars/rows | `focusSection()` per logical cluster so focus can cross gaps |
-| `isSkipForwardEnabled = false` to block skipping | `requiresLinearPlayback = true` |
-| Hand-rolled `AVPlayerLayer` UI | `AVPlayerViewController` (transport bar, subtitles, interstitials free) |
-| `AVAssetResourceLoaderDelegate` for new FairPlay | `AVContentKeySession` + `AVContentKeySessionDelegate` |
-| Deprecated `TVTopShelfProvider` | `TVTopShelfContentProvider` subclass |
-| `DispatchQueue.main.async` to update UI | Already `@MainActor` under default isolation; just assign |
-| Treating UniFFI types as `Sendable` | Confine to an `actor`; map to `Sendable` structs at the boundary |
-| `VStack` of all posters | `LazyVGrid`/`LazyHStack` in a `ScrollView` |
-| CocoaPods / Carthage | SwiftPM |
-| Blocking `swiftc` before build with SwiftLint | Lint compilable code; run as plugin/Run Script/pre-commit |
-| Mixing `#expect` into `XCTestCase` | Swift Testing for logic; XCTest only for XCUITest/perf |
-| `AVAsset` synchronous property access | `try await asset.load(.isPlayable, .duration)` |
+| Wrong | Why | Right |
+|---|---|---|
+| Building UI around tap/drag gestures | tvOS has no touch; input is focus + select via the remote | Design focus-driven layouts with `.focusable`, `.focusSection()`, `defaultFocus`, and `.buttonStyle(.card)` |
+| Writing app data to `Documents` / the app bundle | tvOS has no persistent `Documents`; the bundle is read-only | Use `Caches`/`tmp` (treat as purgeable), `UserDefaults` (500 KB local limit), iCloud KVS, CloudKit, or Keychain |
+| Storing more than ~512 KB in `UserDefaults` | tvOS warns at 512 KB (`sizeLimitExceededNotification`) and terminates the app at 1 MB | Keep only small preferences in `UserDefaults`; move bulk data to iCloud/CloudKit/backend |
+| Expecting a bare `nonisolated async` func to run in the background | Under approachable concurrency it runs on the caller's actor (`nonisolated(nonsending)`) | Mark CPU-bound work `@concurrent`, or move shared mutable state into an `actor` |
+| `Task.detached { … }` to "get off main" | Discards actor context and priority | Use a `@concurrent` function or an actor with inherited context |
+| Marking UniFFI-generated types `@unchecked Sendable` | Hides a real data-race hazard; async generated code isn't `Sendable`-safe yet | Regenerate against current UniFFI; confine async Rust objects to one actor |
+| Adding/removing `AVPlayer` time observers or KVO without a single owner | Removing on the wrong object or after item replacement crashes on tvOS | Own the token; remove before `replaceCurrentItem`; tie teardown to `AsyncStream.onTermination` |
+| Using `VideoPlayer` then trying to customize the transport bar | SwiftUI `VideoPlayer` exposes almost no transport-bar API | Wrap `AVPlayerViewController` with `UIViewControllerRepresentable` for `transportBarCustomMenuItems` etc. |
+| Hand-rolling focus scaling with `scaleEffect`/animations | Fights the system focus engine and looks non-native | Use built-in tvOS button styles that provide the focus lift and parallax |
+| Bumping the deployment target to use a tvOS 26 API | The tvOS 18 minimum is a constraint, not a stale value | Gate new APIs behind `if #available(tvOS 26, *)` |
+| Setting `SWIFT_VERSION` expecting it to pick the toolchain | `SWIFT_VERSION` selects the *language mode*, not the compiler | Toolchain comes from Xcode; set language mode to `6.0` and mode flags separately |
+| Eight-plus tabs (or `TabSection`) with `.sidebarAdaptable` | Verified tvOS 18 bug: back-swipe fails to reveal the collapsed sidebar | Keep primary tabs ≤ 7; verify sidebar reveal when using sections |
+| `swift-format` invoked as one hyphenated word inside a Swift build | The bundled toolchain command is `swift format` (with a space) | Call `swift format …`, or `xcrun --find swift-format` for the binary path |
 
 ## Version & compatibility
 
-| Component | Target | Notes |
-| --- | --- | --- |
-| Swift | 6.3 (6.3.1 stable, Apr 2026) | Swift 6.4 is preview-only — do not target |
-| Xcode | 26.x | ships Swift 6.3; enables approachable concurrency for new targets |
-| tvOS | 26 (26.5, May 2026) | supersedes "tvOS 18"; Liquid Glass only on Apple TV 4K 2nd-gen+ |
-| Concurrency | SE-0466 default isolation, SE-0461 caller-runs | `SWIFT_DEFAULT_ACTOR_ISOLATION=MainActor`, `SWIFT_APPROACHABLE_CONCURRENCY=YES` |
-| SwiftPM traits | SE-0450, Swift 6.1 | `swift-tools-version: 6.1`+; use `.default` (singular) |
-| Focus API | `@FocusState` tvOS 15+, `focusSection()` tvOS 15+, `CardButtonStyle` tvOS 14+ | all current on tvOS 26 |
-| AVContentKeySession | iOS/tvOS 11+ | modern FairPlay path |
-| Swift Testing | Xcode 16+ | unit/logic; XCUITest stays on XCTest |
-| SwiftLint | 0.65.0 (Jun 2026) | SPM-pinned; requires macOS 13+ |
-| XcodeGen | current | `xcodegen generate`; don't commit `.xcodeproj` |
-| UniFFI | mozilla/uniffi-rs, `uniffi-bindgen-swift` library mode | XCFramework + SwiftPM binary target |
+| Component | Targeted line | Notes / availability floor |
+|---|---|---|
+| Swift toolchain | 6.3 | Ships in Xcode 26.4 (later patches: 6.3.3 in Xcode 26.6) |
+| Language mode | Swift 6 | `.swiftLanguageMode(.v6)` / `SWIFT_VERSION = 6.0` |
+| Xcode / SDK | 26.4+ (tvOS 26 SDK) | Build against current SDK |
+| Minimum deployment target | tvOS 18.0 | Hard constraint; gate tvOS 26 APIs behind `#available` |
+| Approachable concurrency | Swift 6.2+ | `defaultIsolation(MainActor.self)`, `nonisolated(nonsending)`, `@concurrent` |
+| `InlineArray` / `Span` | stdlib 6.2 | Availability floor tvOS 26 — must be gated at this minimum |
+| XcodeGen | 2.46.0 | `project.yml`; `xcodegen generate` |
+| SwiftPM tools-version | 6.3 | `.defaultIsolation` available since tools-version 6.2 |
+| SwiftLint | 0.65.1 | via `SwiftLintPlugins` 0.65.1 build-tool plugin (SwiftLint dev requires Swift 6.1+) |
+| swift-format | 603.0.0 | Bundled with toolchain; run as `swift format` |
+| UniFFI (uniffi-rs) | 0.32.0 | Proc-macro bindings; `uniffi-bindgen-swift` |
+| Rust tvOS targets | Tier 2 (no host tools) | `aarch64-apple-tvos`, `aarch64-apple-tvos-sim` via `rustup`; stable Cargo, no `-Zbuild-std` |
+| Swift Testing | 6.3 | Default for unit tests; XCTest for `XCUIApplication` UI tests |
 
-- **Research date:** August 22, 2026
-- **Research basis:** current official docs, release notes, specifications, changelogs, and primary repositories.
+- **Research date:** 2026-09-05

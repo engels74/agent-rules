@@ -1,268 +1,101 @@
 ---
 type: "agent_requested"
-description: "Bun + Astro 7 + Svelte 5 islands + UnoCSS + shadcn-svelte + Biome coding guidelines"
+description: "Bun + Astro 7 + Svelte 5 + UnoCSS + shadcn-svelte + Biome coding guidelines"
 ---
+# Islands on Bun: Astro 7 + Svelte 5 + UnoCSS Production Reference
 
-# Astro 7 Islands with Svelte 5, UnoCSS, and Bun
+This stack is a static-first, islands-architecture web framework: Astro 7 renders HTML at build time (or on demand behind an adapter), ships zero JavaScript by default, and hydrates individual Svelte 5 components only where you ask. Optimize for shipping the least client JS possible — reach for a `client:*` directive only when a component genuinely needs interactivity, keep everything else as server-rendered `.astro`, and move data work into Actions, content collections, and server islands rather than client fetches. Bun is the runtime, package manager, and script runner; UnoCSS is the atomic-CSS engine; shadcn-svelte supplies owned, copy-in component source; Biome is the formatter and linter.
 
-This stack is a content-first, zero-JS-by-default site engine (Astro 7) that ships islands of interactivity as compiled Svelte 5 components, styled by UnoCSS's on-demand atomic engine with shadcn-svelte components adapted via `unocss-preset-shadcn`, all run and packaged by Bun and kept clean by Biome. Optimize for **static HTML by default, minimal hydrated JavaScript, and type-safe server boundaries** (content collections, actions, `astro:env`). The framework's job is to render HTML on the server; a Svelte island exists only where you explicitly opted into client interactivity with a `client:*` directive.
+The biggest way agents write wrong-but-plausible code here is importing habits from SvelteKit and from Tailwind-based shadcn. This is **not** SvelteKit: there is no `$app/state`, no `+page.server.ts`, no form actions in the SvelteKit sense, no `$lib` filesystem magic — routing, data loading, and server logic are Astro's (`src/pages`, Actions, content layer, middleware). And shadcn-svelte's own docs assume Tailwind v4; on this stack styling is UnoCSS, so the Tailwind CLI init path does not apply and you wire shadcn's tokens through `unocss-preset-shadcn` instead. Second: agents write Svelte 4 (`export let`, stores, `on:click`, `$:`, `createEventDispatcher`, `new Component()`) — none of that belongs in new code here. Third: agents forget that each island hydrates in isolation, so `.svelte.ts` rune state is not automatically shared between two separate islands on a page.
 
-The biggest way agents write wrong-but-plausible code here is importing habits from adjacent ecosystems: writing Svelte 4 syntax (`export let`, `on:click`, `$:`, stores-first) instead of Svelte 5 runes; writing Tailwind-project assumptions (a `tailwind.config.js`, PostCSS, `@apply`) instead of UnoCSS's `uno.config.ts`; reaching for Node/npm APIs and `package-lock.json` instead of Bun's runtime and text lockfile; and treating an Astro island like a React app root (passing functions or non-serializable props across the island boundary). Everything below shows the one modern, correct way.
+## Project layout and Bun toolchain
 
-## Stack snapshot & versions
+Bun is the whole toolchain: `bun install` (writes the text `bun.lock`), `bun run <script>`, `bunx` for one-off binaries, and `bun test` for plain-TypeScript unit tests. Run Astro's CLI through Bun's own runtime with the `--bun` flag so Astro executes on Bun rather than Node.
 
-- **Research date:** 2026-08-22
-- **Research basis:** current official docs, release notes, specifications, changelogs, and primary repositories.
+`package.json` scripts:
 
-| Tool | Target version | Notes |
-| --- | --- | --- |
-| Bun | 1.4.x | Rust rewrite; runtime + package manager + test runner + bundler. Node 26-compatible. |
-| Astro | 7.2.x (7.0 released June 22, 2026) | Rust `.astro` compiler, Vite 8 + Rolldown, Sätteri Markdown, queued rendering default. |
-| `@astrojs/svelte` | 9.x | The Svelte 5 line. Install `@astrojs/svelte@5` only if you need Svelte 3/4. |
-| Svelte | 5.x | Runes; attachments since 5.29; `$props.id()` since 5.20. |
-| nanostores | 1.x | Cross-island state. Svelte needs no adapter (store contract); `@nanostores/svelte-runes` 1.x only for `.svelte.ts`. |
-| TypeScript | 5.9.x | `erasableSyntaxOnly` since 5.8; `verbatimModuleSyntax` since 5.0. |
-| UnoCSS | 66.x | `presetWind4` (Tailwind v4-compatible). |
-| `unocss-preset-shadcn` | 1.0.1 | Supports `presetWind4` by default; legacy Wind3 at `unocss-preset-shadcn/v3`. |
-| shadcn-svelte | 1.5.0 (released Aug 2, 2026) | Svelte 5; CLI defaults to Tailwind v4 — see UnoCSS coexistence section. |
-| Biome | 2.5.x | Formatter + linter; framework file support is opt-in and experimental. |
-
-Runtime floors: Astro 7 requires **Node.js 22+** (met by Bun's Node compatibility). Assume every floor is met; do not hedge for older runtimes.
-
-## Project layout & Bun as the runner
-
-Run everything through Bun. Use `bun --bun` so Astro's CLI executes on the Bun runtime rather than Node.
-
-```jsonc
-// package.json
+```json
 {
-  "name": "site",
+  "name": "acme-web",
   "type": "module",
-  "private": true,
   "scripts": {
     "dev": "bun --bun astro dev",
     "build": "bun --bun astro build",
     "preview": "bun --bun astro preview",
-    "check": "astro check && biome check .",
-    "fix": "biome check --write .",
-    "test": "bun test"
-  },
-  "dependencies": {
-    "astro": "^7.2.0",
-    "@astrojs/svelte": "^9.0.0",
-    "@astrojs/node": "^11.0.0",
-    "svelte": "^5.38.0",
-    "nanostores": "^1.5.0",
-    "@nanostores/persistent": "^1.3.0",
-    "clsx": "^2.1.1",
-    "tailwind-merge": "^3.0.0",
-    "tailwind-variants": "^3.3.0"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "^2.5.0",
-    "unocss": "^66.8.0",
-    "@unocss/astro": "^66.8.0",
-    "@unocss/reset": "^66.8.0",
-    "unocss-preset-shadcn": "^1.0.1",
-    "unocss-preset-animations": "^1.3.0",
-    "typescript": "^5.9.0"
+    "check": "astro check && bunx svelte-check --tsconfig ./tsconfig.json",
+    "format": "biome check --write .",
+    "lint": "biome check .",
+    "test": "vitest run",
+    "test:unit": "bun test src/lib",
+    "e2e": "playwright test"
   }
 }
 ```
 
-Standard project shape:
-
-```text
-├─ astro.config.mts        # Astro config (typed, .mts)
-├─ uno.config.ts           # UnoCSS config — the styling source of truth
-├─ biome.json              # formatter + linter
-├─ bunfig.toml             # Bun runtime/install config
-├─ bun.lock                # text lockfile — commit this
-├─ tsconfig.json
-├─ components.json         # shadcn-svelte registry config
-└─ src/
-   ├─ pages/               # file-based routes (.astro, .ts endpoints)
-   ├─ layouts/
-   ├─ components/          # .astro + .svelte islands
-   │  └─ ui/               # shadcn-svelte components live here
-   ├─ lib/
-   │  ├─ utils.ts          # cn() helper
-   │  └─ stores/           # nanostores + .svelte.ts rune modules
-   ├─ actions/index.ts     # astro:actions
-   ├─ content.config.ts    # content collections
-   ├─ middleware.ts
-   └─ env.d.ts
-```
-
-**Bun install & lockfile.** Bun v1.2 changed the default lockfile format to the text-based `bun.lock`; commit it, and never keep a `package-lock.json` or `bun.lockb` alongside. To migrate a legacy binary lockfile, run `bun install --save-text-lockfile --frozen-lockfile --lockfile-only` and delete `bun.lockb`. Run `bun install --frozen-lockfile` in CI to fail on drift.
+`bunfig.toml` — keep it minimal; the defaults are good. Set frozen installs in CI via the flag, not config:
 
 ```toml
-# bunfig.toml
 [install]
-# Bun defaults to the isolated linker for new workspaces; explicit here for clarity.
-linker = "isolated"
-
-[install.lockfile]
-# Only "yarn" is supported as an extra printed format; usually omit this entirely.
-# print = "yarn"
+exact = false
 
 [test]
-coverage = false
+# Only plain-TS unit tests run under bun test; Svelte/Astro components go through Vitest.
+root = "./src/lib"
 ```
 
-For monorepos use Bun workspaces with **catalogs** to pin one version of a shared dependency across packages:
+Commit `bun.lock` (text, reviewable in PRs). CI installs with `bun install --frozen-lockfile` so a stale lockfile fails the build instead of silently drifting.
 
-```jsonc
-// package.json (workspace root)
-{
-  "workspaces": ["packages/*"],
-  "catalog": {
-    "svelte": "^5.38.0",
-    "astro": "^7.2.0"
-  }
-}
-```
+**Bun as a package manager gotcha:** `bun run test` can fail with `vitest: command not found` because Bun does not always put `node_modules/.bin` on `PATH` for nested scripts — invoke test binaries with `bunx` (`bunx vitest run`) or through a `package.json` script, which Bun resolves correctly.
 
-```jsonc
-// packages/web/package.json
-{ "dependencies": { "svelte": "catalog:", "astro": "catalog:" } }
-```
+## Astro configuration, output modes, and the Bun adapter question
 
-Bun-native APIs worth using in scripts, endpoints, and tooling (not in hydrated island code, which runs in the browser): `Bun.file()` for zero-copy file reads, `Bun.$` for shell scripting, and `bun:sqlite` for a synchronous embedded DB.
+`astro.config.mjs` is the single source of truth for integrations and rendering mode. Default output is static (`output: 'static'`); add an adapter only when you need on-demand rendering (SSR routes, Actions that mutate, sessions, or server islands). You can keep a static site and still opt individual routes into on-demand rendering with `export const prerender = false`, or use server islands (below) — you do not need to flip the whole site to `server`.
 
-```ts
-// scripts/seed.ts — run with: bun scripts/seed.ts
-import { Database } from "bun:sqlite";
-import { $ } from "bun";
+**Adapter on Bun:** there is no current, maintained official Bun adapter for Astro 7. The community Bun adapters pin to older Astro majors, so on Astro 7 the correct answer is the Node adapter running under the Bun runtime — Bun is Node-API compatible, so `@astrojs/node` builds a standalone server that you launch with `bun ./dist/server/entry.mjs`. This gives you Bun's fast install/run without depending on an unmaintained adapter.
 
-const db = new Database("data/app.sqlite", { create: true });
-db.run("CREATE TABLE IF NOT EXISTS posts (id TEXT PRIMARY KEY, title TEXT)");
-
-const raw = await Bun.file("data/posts.json").json();
-const insert = db.prepare("INSERT OR REPLACE INTO posts (id, title) VALUES (?, ?)");
-for (const p of raw) insert.run(p.id, p.title);
-
-await $`echo "seeded ${raw.length} posts"`;
-```
-
-## Astro configuration & rendering modes
-
-Use a typed `astro.config.mts`. Wire the Svelte integration and UnoCSS, and choose an adapter only when you need on-demand rendering.
-
-```ts
-// astro.config.mts
-import { defineConfig, envField } from "astro/config";
-import svelte from "@astrojs/svelte";
-import node from "@astrojs/node";
-import UnoCSS from "unocss/astro";
+```js
+// astro.config.mjs
+import { defineConfig, envField } from 'astro/config';
+import node from '@astrojs/node';
+import svelte from '@astrojs/svelte';
+import UnoCSS from 'unocss/astro';
 
 export default defineConfig({
-  // "static" is the default. Use "server" only if most routes are on-demand.
-  output: "static",
-  adapter: node({ mode: "standalone" }), // required for actions, sessions, server islands
+  output: 'static',
+  adapter: node({ mode: 'standalone' }),
   integrations: [
-    UnoCSS({ injectReset: true }), // injects @unocss/reset Tailwind reset
+    UnoCSS({ injectReset: true }),
     svelte(),
   ],
   env: {
     schema: {
-      PUBLIC_SITE_NAME: envField.string({ context: "client", access: "public", default: "Site" }),
-      DATABASE_URL: envField.string({ context: "server", access: "secret" }),
-      LOG_LEVEL: envField.enum({
-        context: "server", access: "public",
-        values: ["debug", "info", "warn", "error"], default: "info",
-      }),
+      PUBLIC_SITE_URL: envField.string({ context: 'client', access: 'public' }),
+      DATABASE_URL: envField.string({ context: 'server', access: 'secret' }),
+      SESSION_SECRET: envField.string({ context: 'server', access: 'secret' }),
     },
   },
-});
-```
-
-**Rendering model.** Astro prerenders every page to static HTML unless you opt a route into on-demand rendering. With `output: "static"` (the default), mark individual routes on-demand with `export const prerender = false`. With `output: "server"`, everything is on-demand and you opt *out* per route with `export const prerender = true`. Actions, sessions, and server islands need an adapter and an on-demand context.
-
-```astro
----
-// src/pages/dashboard.astro — on-demand in an otherwise static build
-export const prerender = false;
----
-```
-
-Astro 7's queued rendering (~2.4× faster on expression-dense pages) and the Rust compiler are on by default — no config. Note the compiler is now JSX-strict: unclosed tags error instead of being auto-corrected, and whitespace between inline elements is collapsed; insert `{' '}` where you need a literal space.
-
-### Advanced routing (`src/fetch.ts`)
-
-Add `src/fetch.ts` only when you need full control of the request pipeline (auth before actions, a proxied API, Hono middleware). Omitting the file keeps Astro's default behavior.
-
-```ts
-// src/fetch.ts
-import { astro, FetchState } from "astro/fetch";
-
-export default {
-  fetch(request: Request) {
-    const state = new FetchState(request);
-    if (state.url.pathname.startsWith("/api/legacy")) {
-      const url = new URL(state.url.pathname, "https://backend.example.com");
-      return fetch(new Request(url, request));
-    }
-    return astro(state);
+  session: {
+    driver: 'fs', // dev-friendly; swap for a real driver in production
   },
-};
-```
-
-### Route caching
-
-Route caching is stable in Astro 7. Configure a provider once, then set directives per response or declaratively via `routeRules`.
-
-```ts
-// astro.config.mts (excerpt)
-import { defineConfig, memoryCache } from "astro/config";
-export default defineConfig({
-  cache: { provider: memoryCache() },
-  routeRules: { "/blog/[...path]": { maxAge: 300, swr: 60 } },
 });
 ```
 
-## Content collections & the Content Layer API
+**Integration order matters:** register `UnoCSS()` before `svelte()` so the UnoCSS Vite plugin processes class output ahead of the Svelte compiler. `injectReset: true` is required because `@unocss/astro` does not inject a browser reset by default, and shadcn's tokens assume a Tailwind-style reset is present.
 
-Define collections in `src/content.config.ts` using loaders. Use the built-in `glob()` and `file()` loaders from `astro/loaders`; write a custom loader for remote sources. The legacy `type: 'content'` syntax is gone — always use `loader`.
+Astro 7 requires Node 22.12 or newer for its build-time tooling even when you deploy on Bun — this comes from Vite 8, which requires Node.js 20.19+ or 22.12+ so `require(esm)` works without a flag. Astro 7 runs on Vite 8, whose Rolldown (a Rust-based bundler) replaces both esbuild and Rollup with a single unified bundler that is 10–30× faster than Rollup in benchmarks while supporting the same Rollup and Vite plugin APIs. Vite 8 ships a compatibility layer that auto-converts existing `esbuild` and `rollupOptions` configuration to their Rolldown equivalents, so the plugins above need no config changes.
 
-```ts
-// src/content.config.ts
-import { defineCollection, z } from "astro:content";
-import { glob, file } from "astro/loaders";
+### Routing
 
-const blog = defineCollection({
-  // deferRender defers Markdown rendering to page render time (lower build memory)
-  loader: glob({ pattern: "**/*.md", base: "./src/content/blog", deferRender: true }),
-  schema: ({ image }) =>
-    z.object({
-      title: z.string(),
-      pubDate: z.coerce.date(),
-      draft: z.boolean().default(false),
-      cover: image().refine((img) => img.width >= 1200, {
-        message: "Cover must be ≥1200px wide",
-      }),
-      tags: z.array(z.string()).default([]),
-    }),
-});
-
-const authors = defineCollection({
-  loader: file("src/data/authors.json"), // array of objects, each with a unique id
-  schema: z.object({ id: z.string(), name: z.string(), url: z.string().url().optional() }),
-});
-
-export const collections = { blog, authors };
-```
-
-Query with the typed `astro:content` API. `getCollection` returns fully typed entries; `render()` produces the `<Content />` component.
+File-based routing lives in `src/pages`. `src/pages/index.astro` → `/`, `src/pages/blog/[slug].astro` → dynamic segment, `src/pages/[...path].astro` → rest/catch-all. For static builds, dynamic pages export `getStaticPaths()`; for on-demand pages, read `Astro.params` directly. API routes are `.ts` files exporting HTTP-method functions (`export function GET(context) {}`).
 
 ```astro
 ---
-// src/pages/blog/[...slug].astro
-import { getCollection, render } from "astro:content";
-import Layout from "../../layouts/Base.astro";
+// src/pages/blog/[slug].astro
+import { getCollection, render } from 'astro:content';
+import Layout from '../../layouts/Layout.astro';
 
 export async function getStaticPaths() {
-  const posts = await getCollection("blog", ({ data }) => !data.draft);
+  const posts = await getCollection('blog', ({ data }) => !data.draft);
   return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
 }
 
@@ -270,586 +103,428 @@ const { post } = Astro.props;
 const { Content } = await render(post);
 ---
 <Layout title={post.data.title}>
-  <article><Content /></article>
+  <article class="prose mx-auto max-w-2xl">
+    <h1>{post.data.title}</h1>
+    <Content />
+  </article>
 </Layout>
 ```
 
-A custom remote loader is just an object with a `load()` method:
+## Content layer and collections
+
+Define collections in `src/content.config.ts` (the current location — not `src/content/config.ts`). Use the built-in `glob()` and `file()` loaders for local content, validate frontmatter with a Zod schema, and query with `getCollection`/`getEntry`. Render Markdown/MDX with the top-level `render(entry)` function and the returned `<Content />` component. The old per-entry `entry.render()` method and `entry.slug` are gone — entries have `id`, and you call `render(entry)`.
 
 ```ts
-// src/loaders/products.ts
-import type { Loader } from "astro/loaders";
-export function productLoader(apiUrl: string): Loader {
-  return {
-    name: "product-loader",
-    async load({ store, meta, logger, parseData }) {
-      const res = await fetch(apiUrl);
-      const products = await res.json();
-      store.clear();
-      for (const p of products) {
-        const data = await parseData({ id: String(p.id), data: p });
-        store.set({ id: data.id, data });
-      }
-      logger.info(`Loaded ${products.length} products`);
-    },
-  };
-}
+// src/content.config.ts
+import { defineCollection, z } from 'astro:content';
+import { glob, file } from 'astro/loaders';
+
+const blog = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/blog' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    pubDate: z.coerce.date(),
+    updatedDate: z.coerce.date().optional(),
+    draft: z.boolean().default(false),
+    tags: z.array(z.string()).default([]),
+  }),
+});
+
+const authors = defineCollection({
+  loader: file('src/content/authors.json'),
+  schema: z.object({ id: z.string(), name: z.string(), url: z.string().url().optional() }),
+});
+
+export const collections = { blog, authors };
 ```
 
-## Svelte 5 islands: props, hydration, and directives
+The data store is immutable in production and only rebuilt at build time — a deployed static site cannot mutate a collection without a rebuild. In `astro dev` you can force a re-sync with the `s`+`Enter` hotkey. For large Markdown collections whose rendered HTML dwarfs the source, pass `deferRender: true` to `glob()` so rendering happens on demand per page instead of holding all HTML in memory during sync.
 
-A `.svelte` file becomes an island the moment you import it into an `.astro` file and add a `client:*` directive. Without a directive it renders to static HTML with no JavaScript shipped.
+Note that Astro 7's default Markdown/MDX pipeline is native (Rust-powered) and no longer includes the remark/rehype pipeline by default; GFM, smart punctuation, heading IDs, footnotes, and frontmatter are built in. If a project depends on specific remark/rehype plugins, that pipeline must be reinstalled and configured explicitly — do not assume remark plugins are available out of the box.
 
-```astro
----
-// src/pages/index.astro
-import Counter from "../components/Counter.svelte";
-import Search from "../components/Search.svelte";
----
-<Counter client:load start={5} />        {/* hydrate immediately */}
-<Search client:visible />                  {/* hydrate when scrolled into view */}
-<Counter client:idle />                    {/* hydrate when main thread idle */}
-<Counter client:media="(min-width: 768px)" /> {/* hydrate at breakpoint */}
-<Counter client:only="svelte" />           {/* skip SSR, render only on client */}
-```
+## Actions: type-safe server functions
 
-| Directive | Hydrates | Use for |
-| --- | --- | --- |
-| `client:load` | Immediately on load | Above-the-fold, must-work-now widgets |
-| `client:idle` | On `requestIdleCallback` | Low-priority interactivity |
-| `client:visible` | On intersection | Below-the-fold islands (the default choice) |
-| `client:media` | When media query matches | Responsive-only UI (mobile menu) |
-| `client:only="svelte"` | Client only, no SSR HTML | Components that touch `window`/`localStorage` at init |
-
-**Critical island rule: props must be serializable.** Astro serializes island props over the wire, so pass strings, numbers, booleans, plain objects, arrays, `Date`/`Map`/`Set` — **never functions or class instances**. Cross-island communication happens through shared state (nanostores), not callbacks.
-
-### Runes in depth
-
-Runes are compiler keywords (no import) usable in `.svelte`, `.svelte.ts`, and `.svelte.js` files. The five you use constantly are `$state`, `$derived`, `$effect`, `$props`, `$bindable`.
-
-```svelte
-<!-- src/components/Counter.svelte -->
-<script lang="ts">
-  interface Props { start?: number; step?: number; }
-  let { start = 0, step = 1 }: Props = $props();
-
-  let count = $state(start);
-  let doubled = $derived(count * 2);
-  // $derived.by for multi-statement derivations
-  let parity = $derived.by(() => (count % 2 === 0 ? "even" : "odd"));
-
-  // $effect is an escape hatch for side effects — NOT for syncing state
-  $effect(() => {
-    document.title = `Count: ${count}`;
-    return () => { /* cleanup on teardown / before re-run */ };
-  });
-</script>
-
-<button onclick={() => (count += step)}>
-  {count} (×2 = {doubled}, {parity})
-</button>
-```
-
-Rune reference and when to reach for each:
-
-| Rune | Purpose | Version |
-| --- | --- | --- |
-| `$state` | Deep-reactive mutable value | 5.0 |
-| `$state.raw` | Non-deep state (reassign only; cheaper for large objects/arrays) | 5.0 |
-| `$state.snapshot` | Plain (non-proxied) copy for logging / passing to non-Svelte code | 5.0 |
-| `$derived` / `$derived.by` | Computed values (always consistent, lazily recomputed) | 5.0 |
-| `$effect` / `$effect.pre` / `$effect.root` | Side effects; pre runs before DOM update; root creates a manually disposed scope | 5.0 |
-| `$props` / `$bindable` | Component inputs; `$bindable` enables two-way binding | 5.0 |
-| `$props.id()` | Unique, SSR-stable per-instance id (for `for`/`aria-*`) | 5.20 |
-| `$host` | The custom-element host (only in `customElement` compile mode) | 5.0 |
-| `$inspect` | Dev-only reactive logging | 5.0 |
-
-**The single sharpest gotcha:** do not use `$effect` to keep one piece of state in sync with another — use `$derived`. Reserve `$effect` for genuine side effects (network calls, manual DOM work, third-party libs). Also: plain class fields are not reactive; declare them with `$state`.
-
-```ts
-// src/lib/stores/cart.svelte.ts — reactive state shared across a Svelte island tree
-class Cart {
-  items = $state<{ id: string; price: number }[]>([]);
-  total = $derived(this.items.reduce((s, i) => s + i.price, 0));
-  add(item: { id: string; price: number }) { this.items.push(item); }
-}
-export const cart = new Cart();
-```
-
-### Snippets replace slots; events are attributes
-
-Svelte 5 removed slots in favor of snippets rendered with `{@render}`, and event directives (`on:click`) in favor of event attributes (`onclick`). `children` is the default snippet.
-
-```svelte
-<!-- src/components/Card.svelte -->
-<script lang="ts">
-  import type { Snippet } from "svelte";
-  interface Props {
-    title: string;
-    header?: Snippet;             // optional named snippet
-    children: Snippet;            // default content
-    row: Snippet<[{ id: string }]>; // parameterized snippet (tuple of args)
-  }
-  let { title, header, children, row }: Props = $props();
-</script>
-
-<section>
-  {#if header}<header>{@render header()}</header>{/if}
-  <h2>{title}</h2>
-  {@render children()}
-  {@render row({ id: "abc" })}
-</section>
-```
-
-```svelte
-<!-- consumer -->
-<Card title="Reports">
-  {#snippet header()}<strong>Q3</strong>{/snippet}
-  {#snippet row(item)}<tr><td>{item.id}</td></tr>{/snippet}
-  <p>Default children content.</p>
-</Card>
-```
-
-Use `{@render children?.()}` with optional chaining when a snippet may be undefined, or an `{#if}`/`{:else}` block for fallback content.
-
-### Attachments, keyed each, class/style directives
-
-Attachments (`{@attach}`, available in Svelte 5.29 and newer) replace actions (`use:`) and are fully reactive — they re-run when their dependencies change and return a cleanup function.
-
-```svelte
-<script lang="ts">
-  import tippy from "tippy.js";
-  import type { Attachment } from "svelte/attachments";
-  let text = $state("Hello");
-  function tooltip(content: string): Attachment {
-    return (node) => {
-      const instance = tippy(node, { content });
-      return () => instance.destroy();
-    };
-  }
-</script>
-<input bind:value={text} />
-<button {@attach tooltip(text)}>Hover me</button>
-```
-
-Always key `{#each}` blocks over a stable id to preserve identity and state across reorders. Prefer `class:`/`style:` directives and the object/array `class` form over string concatenation:
-
-```svelte
-{#each items as item (item.id)}
-  <li class:active={item.id === selected} style:--w={item.width}>{item.label}</li>
-{/each}
-```
-
-### Mounting, typing, and stores vs runes
-
-Instantiate components imperatively with `mount`/`unmount`, never `new Component`. Type a component reference with the `Component` type and snippets with `Snippet`.
-
-```ts
-import { mount, unmount, type Component } from "svelte";
-import Widget from "./Widget.svelte";
-const app = mount(Widget, { target: document.getElementById("app")!, props: { start: 3 } });
-// later: unmount(app);
-```
-
-**Stores vs runes:** use runes (`$state` in `.svelte.ts`) for new shared state within a Svelte island tree. Svelte stores still work and remain useful for interop, but runes are the default. For state shared **across separate Astro islands** (different framework roots that cannot share a Svelte module scope reliably at runtime), use nanostores — see below.
-
-## Cross-island state with nanostores
-
-Astro islands are isolated; two `client:*` components do not share a module instance in a way you should rely on for app state. Astro's official recommendation for shared client-side storage is **nanostores**, which ships less than 1 KB of JS with zero dependencies and is framework-agnostic; pair it with `@nanostores/persistent` for `localStorage` sync across page navigations.
-
-```ts
-// src/lib/stores/cart.ts
-import { atom, map, computed } from "nanostores";
-export const isCartOpen = atom(false);
-export const cartItems = map<Record<string, { qty: number; price: number }>>({});
-export const total = computed(cartItems, (items) =>
-  Object.values(items).reduce((s, i) => s + i.qty * i.price, 0),
-);
-export function addItem(id: string, price: number) {
-  const current = cartItems.get()[id];
-  cartItems.setKey(id, { qty: (current?.qty ?? 0) + 1, price });
-}
-```
-
-Consume the store in a `.svelte` island with the `$` auto-subscription shorthand. Nanostores implement Svelte's store contract, so **there is no adapter package to install** and nothing to import but the store itself:
-
-```svelte
-<script lang="ts">
-  import { total, isCartOpen } from "../lib/stores/cart";
-</script>
-{#if $isCartOpen}<aside>Total: ${$total}</aside>{/if}
-```
-
-`$` auto-subscription is a compiler feature of `.svelte` components, so it is unavailable in `.svelte.ts`/`.svelte.js` modules. Use `@nanostores/svelte-runes` there and read through `.current`; it is built on `createSubscriber`, so one subscription is shared per store and SSR stays correct.
-
-```ts
-// src/lib/stores/cart-view.svelte.ts
-import { useStore } from "@nanostores/svelte-runes";
-import { total } from "./cart";
-
-const totalView = useStore(total);
-export function formatted(): string {
-  return `$${totalView.current}`;
-}
-```
-
-There is no `@nanostores/svelte` package — the npm registry has never carried one. The framework adapters (`@nanostores/react`, `/preact`, `/vue`, `/solid`, `/lit`, `/angular`, `/alpine`) exist for frameworks with no equivalent of Svelte's store contract; Svelte needs none.
-
-## Astro Actions: type-safe server functions
-
-Define server logic in `src/actions/index.ts` with `defineAction` and a Zod schema from `astro:schema`. Actions work from HTML forms without client JS and from typed client calls. `accept: "form"` parses `FormData`.
+Actions are the idiomatic way to run server logic from the client without hand-writing API routes. Define them in `src/actions/index.ts` under a `server` export, validate input with Zod (`z` from `astro:schema`), and call them from client code or wire them straight to an HTML `<form>` with `accept: 'form'`. Actions require an adapter (on-demand rendering).
 
 ```ts
 // src/actions/index.ts
-import { defineAction, ActionError } from "astro:actions";
-import { z } from "astro:schema";
+import { defineAction, ActionError } from 'astro:actions';
+import { z } from 'astro:schema';
+import { db } from '../lib/server/db';
 
 export const server = {
-  submitFeedback: defineAction({
-    accept: "form",
+  createComment: defineAction({
+    accept: 'form',
     input: z.object({
-      email: z.string().email(),
-      message: z.string().min(10),
+      postId: z.string(),
+      body: z.string().min(1, 'Comment cannot be empty').max(2000),
     }),
-    handler: async ({ email, message }, context) => {
-      if (message.includes("spam")) {
-        throw new ActionError({ code: "BAD_REQUEST", message: "Rejected." });
+    handler: async ({ postId, body }, context) => {
+      const userId = context.session ? await context.session.get('userId') : undefined;
+      if (!userId) {
+        throw new ActionError({ code: 'UNAUTHORIZED', message: 'Sign in to comment.' });
       }
-      // context has cookies, locals, request — but not getActionResult/redirect
-      return { ok: true, email };
+      const comment = await db.comment.create({ data: { postId, body, userId } });
+      return comment;
     },
   }),
 };
 ```
 
-Handle the no-JS form path with `Astro.getActionResult()` and narrow validation failures with `isInputError()`. Action results persist via a single-use cookie: `getActionResult()` returns a value only on the first request after submission.
+Calling from a Svelte island — the result is a discriminated `{ data, error }` object; check `error` before using `data`, and narrow with `isInputError`:
 
-```astro
----
-// src/pages/feedback.astro
-export const prerender = false;
-import { actions, isInputError } from "astro:actions";
-const result = Astro.getActionResult(actions.submitFeedback);
-if (result && !result.error) return Astro.redirect("/thanks"); // POST/redirect/GET
-const fieldErrors = isInputError(result?.error) ? result.error.fields : {};
----
-<form method="POST" action={actions.submitFeedback}>
-  <input type="email" name="email" required />
-  {fieldErrors.email && <p class="text-red-500">{fieldErrors.email[0]}</p>}
-  <textarea name="message"></textarea>
-  {fieldErrors.message && <p class="text-red-500">{fieldErrors.message[0]}</p>}
-  <button>Send</button>
+```svelte
+<!-- src/components/CommentForm.svelte -->
+<script lang="ts">
+  import { actions, isInputError } from 'astro:actions';
+
+  let { postId }: { postId: string } = $props();
+  let pending = $state(false);
+  let errorMsg = $state<string | null>(null);
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    const formEl = event.currentTarget as HTMLFormElement;
+    pending = true;
+    errorMsg = null;
+    const form = new FormData(formEl);
+    form.set('postId', postId);
+    const { data, error } = await actions.createComment(form);
+    pending = false;
+    if (error) {
+      errorMsg = isInputError(error) ? 'Check your input.' : error.message;
+      return;
+    }
+    formEl.reset();
+  }
+</script>
+
+<form onsubmit={submit} class="flex flex-col gap-2">
+  <textarea name="body" required class="rounded border p-2"></textarea>
+  <button type="submit" disabled={pending} class="rounded bg-primary px-4 py-2 text-primary-foreground disabled:opacity-50">
+    {pending ? 'Posting…' : 'Post comment'}
+  </button>
+  {#if errorMsg}<p class="text-sm text-destructive">{errorMsg}</p>{/if}
 </form>
 ```
 
-From a Svelte island, call the action and destructure `{ data, error }` (or use `actions.name.orThrow()`):
+For pure progressive enhancement, point a plain form at the action (`<form method="POST" action={actions.createComment}>`) and read the result from `Astro.getActionResult()` in the page frontmatter — no client JS required.
 
-```svelte
-<script lang="ts">
-  import { actions } from "astro:actions";
-  let email = $state("");
-  let message = $state("");
-  async function save() {
-    const { data, error } = await actions.submitFeedback({ email, message });
-    if (error) console.error(error);
-    else console.log(data.ok);
-  }
-</script>
+## Server islands
+
+A server island is a server-rendered component that Astro defers: the page ships immediately with fallback content, then the island's real HTML is fetched and swapped in. Mark any component with `server:defer` and provide a `slot="fallback"`. Props must be serializable (plain objects, numbers, strings, `Array`, `Map`, `Set`, `Date`, `URL`, `BigInt`, typed arrays — **not** functions or circular structures). Use this for a small dynamic slice of an otherwise static, cacheable page — a personalized greeting, a live count — so you avoid making the whole route on-demand. Server islands require an adapter.
+
+```astro
+---
+// src/pages/index.astro
+import Layout from '../layouts/Layout.astro';
+import LatestActivity from '../components/LatestActivity.astro';
+---
+<Layout title="Home">
+  <h1>Welcome</h1>
+  <LatestActivity server:defer>
+    <p slot="fallback" class="text-muted-foreground">Loading recent activity…</p>
+  </LatestActivity>
+</Layout>
 ```
 
-## Middleware, locals, and environment
+The island itself reads cookies, the session, or a database directly, because it runs on the server:
 
-Middleware lives in `src/middleware.ts`. Use `defineMiddleware`, `sequence` to compose, and `context.locals` to pass typed data to pages. Type `App.Locals` in `env.d.ts`.
+```astro
+---
+// src/components/LatestActivity.astro
+import { db } from '../lib/server/db';
+const items = await db.activity.findMany({ take: 5, orderBy: { createdAt: 'desc' } });
+---
+<ul class="space-y-1">
+  {items.map((i) => <li>{i.label}</li>)}
+</ul>
+```
+
+## Typed environment variables (`astro:env`)
+
+Declare env vars in the `env.schema` block of `astro.config.mjs` (shown above) using `envField`, then import them from `astro:env/client` or `astro:env/server`. This gives you validation at build/startup and prevents leaking secrets to the client: importing a `secret` server var from `astro:env/client` is a build error, and a missing required var fails loudly instead of surfacing as `undefined`.
+
+```ts
+// server-only module
+import { DATABASE_URL, getSecret } from 'astro:env/server';
+const db = connect(DATABASE_URL);            // typed string, guaranteed present
+const optional = getSecret('FEATURE_FLAG');  // string | undefined, for vars outside the schema
+```
+
+Prefer `astro:env` over raw `import.meta.env` in new code — you get types, validation, and the client/server boundary enforced for you. Public client vars still must be prefixed `PUBLIC_`.
+
+## Sessions, middleware, and auth
+
+Sessions are server-stored state keyed by a cookie, serialized with `devalue` (same supported types as Actions and content: strings, numbers, `Date`, `Map`, `Set`, `URL`, arrays, plain objects). Access via `Astro.session` in `.astro` files and `context.session` in Actions, API routes, and middleware. Configure a `session.driver` in `astro.config.mjs`; sessions require an adapter and are not available in edge middleware.
 
 ```ts
 // src/middleware.ts
-import { defineMiddleware, sequence } from "astro:middleware";
+import { defineMiddleware } from 'astro:middleware';
+import { auth } from './lib/server/auth';
 
-const auth = defineMiddleware(async (context, next) => {
-  const token = context.cookies.get("session")?.value;
-  context.locals.user = token ? await lookupUser(token) : null;
+export const onRequest = defineMiddleware(async (context, next) => {
+  const result = await auth.api.getSession({ headers: context.request.headers });
+  context.locals.user = result?.user ?? null;
   return next();
 });
-
-const timing = defineMiddleware(async (context, next) => {
-  const start = performance.now();
-  const res = await next();
-  res.headers.set("Server-Timing", `total;dur=${performance.now() - start}`);
-  return res;
-});
-
-export const onRequest = sequence(auth, timing);
-async function lookupUser(_t: string) { return { id: "1", name: "Ada" }; }
 ```
+
+Type `context.locals` and session data by declaring the `App` namespace interfaces in `src/env.d.ts`:
 
 ```ts
 // src/env.d.ts
 declare namespace App {
   interface Locals {
-    user: { id: string; name: string } | null;
+    user: { id: string; name: string; email: string } | null;
+  }
+  interface SessionData {
+    userId: string;
+    cart: string[];
   }
 }
 ```
 
-Use `astro:env` for typed environment variables — import public client vars from `astro:env/client` and server secrets from `astro:env/server`. Prefer this over `import.meta.env` and `process.env` for anything in the schema; a missing required var fails loudly instead of being silently `undefined`.
+The stack does not name an auth or database library, so do not invent one; Astro's own sessions, Actions, middleware, and content layer cover most needs. If a project adds authentication, a current Svelte/Astro-friendly choice is Better Auth wired through middleware as above — but that is a project decision, not a stack requirement.
+
+## Svelte 5 islands
+
+Write runes-mode Svelte 5 exclusively. Runes are compiler keywords (not imports) valid only in `.svelte`, `.svelte.ts`, and `.svelte.js` files.
+
+- `$state` holds mutable reactive values; `$derived` computes from them (always consistent, lazy); `$effect` is for side effects only (DOM, network, subscriptions) and runs after DOM updates with cleanup. **Reach for `$derived` before `$effect`** — using an effect to copy one value into another is the single most common Svelte 5 mistake; the reactivity gets tangled and can loop.
+- `$props()` replaces `export let`; destructure with defaults and types. `$bindable()` marks a prop as two-way.
+- Event handlers are plain attributes: `onclick={...}`, not `on:click`. There is no `createEventDispatcher` — pass callback props instead.
+- Snippets (`{#snippet}` / `{@render}`) replace slots. The default slot is the `children` prop.
+- Mount programmatically with `mount`/`unmount`, never `new Component()`.
+- `$state.raw` for large immutable structures you replace wholesale (no deep proxying); `$state.snapshot` to hand a plain non-proxied copy to external code; `$derived.by(() => {...})` for multi-statement derivations; `$effect.pre` to run before DOM update; `untrack` to read reactive state without subscribing.
+
+A component that survives changing props, empty data, and cleanup:
+
+```svelte
+<!-- src/components/SearchList.svelte -->
+<script lang="ts">
+  interface Item { id: string; name: string; }
+  let { items, initialQuery = '' }: { items: Item[]; initialQuery?: string } = $props();
+
+  let query = $state(initialQuery);
+  const filtered = $derived(
+    query.trim() === ''
+      ? items
+      : items.filter((i) => i.name.toLowerCase().includes(query.toLowerCase()))
+  );
+
+  $effect(() => {
+    const id = setTimeout(
+      () => history.replaceState(null, '', `?q=${encodeURIComponent(query)}`),
+      300
+    );
+    return () => clearTimeout(id); // cleanup on query change / unmount
+  });
+</script>
+
+<input bind:value={query} placeholder="Search…" class="w-full rounded border p-2" />
+
+{#if filtered.length === 0}
+  <p class="p-4 text-center text-muted-foreground">No matches for “{query}”.</p>
+{:else}
+  <ul class="divide-y">
+    {#each filtered as item (item.id)}
+      <li class="p-2">{item.name}</li>
+    {/each}
+  </ul>
+{/if}
+```
+
+Always key `{#each}` blocks with a stable id `(item.id)` so reordering and removal update the DOM correctly rather than by index.
+
+### Shared reactive state in `.svelte.ts`
+
+Extract reusable reactive logic into a `.svelte.ts` module. A class-based store keeps state and behavior together:
+
+```ts
+// src/lib/cart.svelte.ts
+class Cart {
+  items = $state<string[]>([]);
+  readonly count = $derived(this.items.length);
+
+  add(id: string) { this.items.push(id); }
+  clear() { this.items = []; }
+}
+
+export const cart = new Cart();
+```
+
+### Islands inside Astro: hydration and state boundaries
+
+In `.astro` files, a Svelte component renders to static HTML unless you add a client directive:
+
+- `client:load` — hydrate immediately (interactive above the fold).
+- `client:idle` — hydrate when the browser is idle (default choice for non-urgent widgets).
+- `client:visible` — hydrate when scrolled into view (below the fold, heavy components).
+- `client:only="svelte"` — skip SSR, render only on the client (for components that touch browser-only APIs).
+- `client:media="(min-width: 768px)"` — hydrate at a breakpoint.
 
 ```astro
 ---
-import { DATABASE_URL } from "astro:env/server";
-import { PUBLIC_SITE_NAME } from "astro:env/client";
+import SearchList from '../components/SearchList.svelte';
+import ThemeToggle from '../components/ThemeToggle.svelte';
+const items = await getItems();
 ---
-<title>{PUBLIC_SITE_NAME}</title>
+<ThemeToggle client:load />
+<SearchList items={items} client:visible />
 ```
 
-`Astro.rewrite("/other")` serves another route without a client redirect; use it for internal fallbacks and localized content.
+**The island boundary is the biggest Svelte-in-Astro gotcha.** Each `client:*` component hydrates as an independent root. Props passed from `.astro` are serialized (JSON-compatible values only — no functions, no class instances). A `.svelte.ts` rune module shared between two *separate* islands on the same page is **not** guaranteed to be one shared instance, because islands are hydrated from separate entry points. For state that must be shared across islands (or across frameworks), use a framework-agnostic store like nanostores (`@nanostores/persistent` for cross-reload persistence); reserve `.svelte.ts` rune singletons for state shared *within a single island's* component tree. To compose an interactive shadcn widget whose trigger and content must talk to each other (dialogs, dropdowns), put the whole composed unit in one `.svelte` file and hydrate that as a single island, rather than island-wrapping the parts separately.
 
-## View transitions & image optimization
+## UnoCSS
 
-The client-side router component is `<ClientRouter />` from `astro:transitions` (renamed from `<ViewTransitions />`, which was removed in Astro 6). Put it in your `<head>` to get SPA-like navigation over MPA pages.
-
-```astro
----
-// src/layouts/Base.astro
-import { ClientRouter } from "astro:transitions";
----
-<html>
-  <head><ClientRouter /></head>
-  <body>
-    <slot />
-  </body>
-</html>
-```
-
-Scripts run only on initial load; re-run per navigation by listening for `astro:page-load`. Preserve element state with `transition:persist` and animate with `transition:animate`.
-
-Optimize images with `astro:assets`. Use `<Image>` for a single optimized image and `<Picture>` for multiple formats; import local images so Astro can infer dimensions and prevent layout shift.
-
-```astro
----
-import { Image, Picture } from "astro:assets";
-import hero from "../assets/hero.png";
----
-<Image src={hero} alt="Hero" width={1200} height={630} loading="eager" />
-<Picture src={hero} formats={["avif", "webp"]} alt="Hero" />
-```
-
-## Server islands
-
-`server:defer` renders an Astro component on the server at request time while the rest of the page is cached/static. Provide fallback content with `slot="fallback"`. Props must be serializable — functions cannot be passed.
-
-```astro
----
-import UserGreeting from "../components/UserGreeting.astro";
----
-<UserGreeting server:defer userId={Astro.locals.user?.id}>
-  <p slot="fallback">Loading…</p>
-</UserGreeting>
-```
-
-Server islands require an adapter. Note a known interaction: combining server islands with `<ClientRouter />` has had head-element and hydration edge cases fixed across 7.x point releases — keep Astro current if you use both together.
-
-## UnoCSS configuration
-
-UnoCSS is the styling engine — there is no `tailwind.config.js`, no PostCSS, no `@apply`. All configuration lives in `uno.config.ts`, and the Astro integration is `unocss/astro`. Use **`presetWind4`** (the Tailwind v4-compatible preset). `presetUno`/`presetWind3` are the older generation; only fall back to `presetWind3` for compatibility with tooling that hasn't caught up.
+Install the `unocss` package and import the Astro integration from `unocss/astro` (this avoids version drift between the meta-package and the standalone integration). Use `presetWind4` — the current Tailwind-v4-compatible preset. Per the UnoCSS Wind4 docs, "we use the oklch color model to support better color contrast and color perception. Therefore, it is not compatible with presetLegacyCompat and is not recommended for use together." Wind4 also aligns its reset with Tailwind 4 and integrates it internally.
 
 ```ts
 // uno.config.ts
-import { defineConfig, presetWind4, presetIcons } from "unocss";
-import { presetShadcn } from "unocss-preset-shadcn";
-import presetAnimations from "unocss-preset-animations";
-import transformerDirectives from "@unocss/transformer-directives";
-import transformerVariantGroup from "@unocss/transformer-variant-group";
+import { defineConfig, presetWind4, presetIcons, presetWebFonts, transformerVariantGroup } from 'unocss';
+import extractorSvelte from '@unocss/extractor-svelte';
+import { presetShadcn } from 'unocss-preset-shadcn';
+import presetAnimations from 'unocss-preset-animations';
 
 export default defineConfig({
   presets: [
     presetWind4(),
     presetAnimations(),
-    presetShadcn({ color: "zinc" }), // shadcn theme CSS variables
-    presetIcons({ scale: 1.2, warn: true }),
+    presetShadcn({ color: 'zinc' }),
+    presetIcons({ scale: 1.2 }),
+    presetWebFonts({ provider: 'google', fonts: { sans: 'Inter:400,500,600,700' } }),
   ],
-  transformers: [transformerDirectives(), transformerVariantGroup()],
-  shortcuts: {
-    "btn": "px-4 py-2 rounded bg-primary text-primary-foreground hover:opacity-90",
-    "card": "rounded-lg border bg-card p-6 shadow-sm",
-  },
-  theme: {
-    colors: { brand: { DEFAULT: "#4f46e5", muted: "#818cf8" } },
-  },
-  // CRITICAL for Astro + Svelte islands + shadcn-svelte:
+  transformers: [transformerVariantGroup()],
+  extractors: [extractorSvelte()],
   content: {
     pipeline: {
       include: [
-        // default extensions (already covers .astro and .svelte)
-        /\.(vue|svelte|[jt]sx|mdx?|astro|elm|php|phtml|html)($|\?)/,
-        // .ts/.js are NOT scanned by default — needed for tailwind-variants defs
-        "(components|src)/**/*.{js,ts}",
+        /\.(vue|svelte|[jt]sx|mdx?|astro|html)($|\?)/,
+        '(components|src)/**/*.{js,ts}',
       ],
     },
   },
 });
 ```
 
-**Critical insight:** UnoCSS scans `.astro`, `.svelte`, `.jsx`, `.html` and similar by default but **excludes `.ts`/`.js`**. shadcn-svelte defines component variants (via `tailwind-variants`) in `.ts` files, so without the explicit `content.pipeline.include` glob those utility classes silently never get generated. This is the single most common "styles missing on my island" bug on this stack. The magic comment `// @unocss-include` at the top of a specific file is a per-file alternative.
+Two content-pipeline additions are mandatory on this stack:
 
-Bring in the browser reset either through the integration (`injectReset: true`, shown earlier) or by importing `@unocss/reset/tailwind.css` in your base layout. `presetWind4` also aligns its own preflight with Tailwind v4, so avoid double resets.
+1. **`@unocss/extractor-svelte`** — UnoCSS does not extract classes from Svelte's `class:foo={bar}` directive by default. Without this extractor those conditional classes are silently missing from the generated CSS.
+2. **`.ts`/`.js` in the include list** — shadcn-svelte re-exports component styling from `index.ts`/`index.js` barrels, and UnoCSS does not scan JS/TS by default. Without `'(components|src)/**/*.{js,ts}'`, shadcn component classes are dropped.
 
-`transformerDirectives` enables `@apply`/`--at-apply` and `theme()` inside `<style>` blocks; `transformerVariantGroup` enables `hover:(bg-white text-black)` grouping. Use `attributify` only if the team wants attribute-mode utilities; it is optional. Populate `safelist` for classes generated only at runtime (e.g. from CMS data) that the static scanner can't see.
+Use `shortcuts` for repeated class clusters and `theme` for design tokens rather than duplicating long class strings across components. `transformerVariantGroup()` lets you write `hover:(bg-primary text-white)` instead of repeating the prefix.
 
-## shadcn-svelte with UnoCSS
+## shadcn-svelte on UnoCSS
 
-shadcn-svelte components are copied into your repo (you own the code); they are built on **Bits UI** for accessible behavior (focus management, keyboard handling, ARIA) and styled with utility classes plus the `cn()` helper (`clsx` + `tailwind-merge`). They live in `src/lib/components/ui` (or `src/components/ui`).
+shadcn-svelte gives you owned component source (copied into your repo, built on `bits-ui` for accessible behavior), not a dependency you import. Its official docs assume Tailwind v4; on this stack you bridge its design tokens through `unocss-preset-shadcn` (added above), which as of its 1.0 line targets `presetWind4` by default. Because you are not using Tailwind, **do not run the shadcn-svelte `init` CLI's Tailwind path** — set the project up manually:
+
+1. Install the runtime deps the components use: `bun add bits-ui clsx tailwind-merge tailwind-variants @lucide/svelte`.
+2. Add the `cn` helper (shadcn-svelte's own utility — `tailwind-merge` + `clsx`, not `tailwind-variants`, for class merging):
 
 ```ts
 // src/lib/utils.ts
-import { type ClassValue, clsx } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { type ClassValue, clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 ```
 
-```jsonc
-// components.json
+3. Create `components.json` manually (the CLI uses it to place added components and resolve aliases). Astro projects use `$lib`-style aliases defined in `tsconfig.json`, not SvelteKit's built-in `$lib`:
+
+```json
 {
   "$schema": "https://shadcn-svelte.com/schema.json",
-  "style": "default",
-  "tailwind": { "config": "", "css": "src/styles/app.css", "baseColor": "zinc" },
+  "tailwind": { "css": "src/styles/app.css", "baseColor": "zinc" },
   "aliases": {
     "components": "$lib/components",
     "utils": "$lib/utils",
     "ui": "$lib/components/ui",
-    "hooks": "$lib/hooks"
+    "hooks": "$lib/hooks",
+    "lib": "$lib"
+  },
+  "typescript": true,
+  "registry": "https://shadcn-svelte.com/registry"
+}
+```
+
+4. Add the matching path alias to `tsconfig.json`:
+
+```jsonc
+{
+  "extends": "astro/tsconfigs/strict",
+  "include": [".astro/types.d.ts", "**/*"],
+  "exclude": ["dist"],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "$lib": ["./src/lib"], "$lib/*": ["./src/lib/*"] }
   }
 }
 ```
 
-**The central integration reality:** shadcn-svelte 1.x's CLI (`bunx shadcn-svelte@latest init`) defaults to **Tailwind v4** (OKLCH `@theme` variables, `@tailwindcss/vite`, no config file). Because you are running **UnoCSS as the CSS engine, not Tailwind**, do not use the CLI's Tailwind setup as-is. `unocss-preset-shadcn` (1.0.1) generates the shadcn theme CSS variables for you. In practice:
+5. Keep an empty `tailwind.config.js` at the project root — the shadcn-svelte CLI expects one to exist even though UnoCSS, not Tailwind, does the work. Then add components with `bunx shadcn-svelte@latest add button dialog`.
 
-- Add `presetShadcn({ color: "zinc" })` to `uno.config.ts` — it emits the `--background`, `--foreground`, `--primary`, etc. variables the components consume. Note the required no-comma HSL variable format (`--background: 0 0% 100%;`, not `0,0%,100%`).
-- Hand-place `utils.ts` and `components.json` rather than relying on the CLI's Tailwind-v4 output; keep an empty `tailwind.config.js` at the root only if a CLI command complains.
-- Provide a dark-mode toggle that flips the `.dark` class on `<html>` (the preset's default `darkSelector`). Only SolidUI needs `darkSelector: '[data-kb-theme="dark"]'`.
-- For dynamic themes, pass an array from `builtinColors` to `presetShadcn` and add a theme-sync script.
-- `unocss-preset-shadcn` 1.0.1 targets `presetWind4` by default; if you must use the older engine, import the legacy build from `unocss-preset-shadcn/v3` alongside `presetWind3`. The preset's README predates shadcn-svelte 1.5's Tailwind-v4 defaults, so components pulled directly from the 1.5 registry (OKLCH, `@theme inline`, `tw-animate-css`) may need manual token reconciliation — verify against a build.
-
-Use a shadcn-svelte component inside an Astro island exactly like any Svelte island (add a `client:*` directive on the wrapping component):
+Import added components into `.astro` or other `.svelte` files:
 
 ```astro
 ---
-import ThemeToggle from "../components/ThemeToggle.svelte";
+import { Button } from '$lib/components/ui/button/index.js';
 ---
-<ThemeToggle client:load />
+<Button>Click me</Button>
 ```
 
-## TypeScript configuration
+**Honest caveat:** `presetWind4` + `unocss-preset-shadcn` + Astro islands is comparatively new territory with no official support path from either the shadcn-svelte or Astro teams. `unocss-preset-shadcn`'s README code sample still imports `presetWind3` even though the package defaults to Wind4 — use `presetWind4()` as shown above and treat the README snippet as out of date. Verify token colors render correctly (oklch) before committing, and expect the preset to occasionally lag shadcn-svelte releases. shadcn-svelte's interactive components are runes-native (`$props`, snippets, `onclick`) and target `bits-ui` v2 — old forum threads claiming "not Svelte 5 ready" are stale.
 
-Extend Astro's strict preset and enable the modern module and erasability flags. `astro check` (which runs the Svelte language tools for `.svelte` files) is your source of truth for type errors across `.astro`, `.svelte`, and `.ts`.
+## View transitions
 
-```jsonc
-// tsconfig.json
-{
-  "extends": "astro/tsconfigs/strict",
-  "compilerOptions": {
-    "verbatimModuleSyntax": true,     // requires explicit `import type`
-    "erasableSyntaxOnly": true,       // bans enum/namespace/param-props (TS 5.8+)
-    "moduleResolution": "bundler",
-    "module": "esnext",
-    "isolatedModules": true,
-    "noUncheckedIndexedAccess": true,
-    "types": ["astro/client"]
-  },
-  "include": [".astro/types.d.ts", "src/**/*"],
-  "exclude": ["dist"]
-}
-```
-
-`erasableSyntaxOnly` (TypeScript 5.8) makes the compiler error on TypeScript-specific constructs that have runtime behavior (`enum`, runtime `namespace`, constructor parameter properties, `import =`), which keeps your source strippable — combine it with `verbatimModuleSyntax`. With `verbatimModuleSyntax`, always separate type-only imports:
-
-```ts
-import type { Snippet } from "svelte";
-import { mount } from "svelte";
-```
-
-Type Astro component props with an interface in the frontmatter, and use `satisfies` to keep literal types while checking a shape:
+Add Astro's `<ClientRouter />` to a shared layout `<head>` to turn multi-page navigation into animated single-page-style transitions with shared/persisted elements. It degrades gracefully where the native View Transitions API is unavailable. Because it swaps the DOM without a full reload, scripts and island state must be reinitialized on navigation — persist elements you want to survive with `transition:persist`.
 
 ```astro
 ---
-interface Props { title: string; count?: number; }
-const { title, count = 0 } = Astro.props;
-
-const config = { theme: "dark", cols: 3 } satisfies Record<string, unknown>;
+// src/layouts/Layout.astro
+import { ClientRouter } from 'astro:transitions';
+const { title } = Astro.props;
 ---
+<html lang="en">
+  <head>
+    <title>{title}</title>
+    <ClientRouter />
+  </head>
+  <body>
+    <slot />
+  </body>
+</html>
 ```
 
-Run `astro check` for full-project type checking (it covers `.astro` and `.svelte`); reserve a standalone `svelte-check` call only for Svelte-only packages without Astro.
+Pair matched elements across pages with `transition:name="hero"` and tune motion with `transition:animate={fade({ duration: '0.3s' })}`. `transition:persist` keeps a component (e.g. an audio player or a hydrated island) mounted across navigations. As native cross-document view transitions gain browser support, `<ClientRouter />` is increasingly optional for the animation itself — reach for it when you need its client-side routing, element persistence, or fallback control.
 
-## Testing with `bun test`
+## Images
 
-Use Bun's built-in Jest-compatible runner (`bun:test`) for unit, logic, and store tests — it's fast and needs no config. Test framework-agnostic logic (nanostores, `.svelte.ts` pure functions, action handlers) directly.
+Use `astro:assets` for local and authorized remote images: the `<Image />` component emits optimized, correctly sized `<img>` with width/height to prevent layout shift, and `getImage()` returns processed attributes for custom markup. Import local images so Astro can process them at build time; declare permitted remote hosts in `astro.config.mjs` (`image.domains` / `image.remotePatterns`).
 
-```ts
-// src/lib/stores/cart.test.ts
-import { test, expect, beforeEach, spyOn, mock } from "bun:test";
-import { cartItems, total, addItem } from "./cart";
-
-beforeEach(() => cartItems.set({}));
-
-test("addItem accumulates quantity", () => {
-  addItem("a", 10);
-  addItem("a", 10);
-  expect(cartItems.get().a.qty).toBe(2);
-  expect(total.get()).toBe(20);
-});
-
-test("spies track calls", () => {
-  const obj = { save: (_x: number) => {} };
-  const spy = spyOn(obj, "save");
-  obj.save(1);
-  expect(spy).toHaveBeenCalledTimes(1);
-  expect(spy.mock.calls).toEqual([[1]]);
-});
-
-test("snapshot", () => {
-  expect({ ok: true, items: 2 }).toMatchSnapshot();
-});
+```astro
+---
+import { Image } from 'astro:assets';
+import hero from '../assets/hero.jpg';
+---
+<Image src={hero} alt="Product hero" width={1200} height={630} loading="eager" />
 ```
 
-`mock.module()` stubs an entire module; `mock.restore()` restores. Update snapshots with `bun test --update-snapshots`.
+## Biome: formatting and linting
 
-For **rendered Svelte component** testing, `bun test` alone does not provide a DOM. Use `@testing-library/svelte` with a DOM environment; because Astro/Svelte's toolchain is Vite-based, **Vitest** is the pragmatic choice for component-DOM and Astro Container API tests, while `bun test` handles fast pure-logic suites. Test `.astro` components by rendering them through Astro's Container API:
-
-```ts
-// component render via Astro Container API (run under Vitest)
-import { experimental_AstroContainer as AstroContainer } from "astro/container";
-import Card from "../src/components/Card.astro";
-import { expect, test } from "vitest";
-
-test("renders card title", async () => {
-  const container = await AstroContainer.create();
-  const html = await container.renderToString(Card, { props: { title: "Hi" } });
-  expect(html).toContain("Hi");
-});
-```
-
-| Test kind | Tool |
-| --- | --- |
-| Pure logic, stores, action handlers | `bun test` |
-| Svelte component + DOM | Vitest + `@testing-library/svelte` |
-| `.astro` component output | Vitest + Astro Container API |
-
-## Biome: formatting, linting, imports
-
-Biome is the formatter and linter (replacing Prettier + ESLint for JS/TS/JSON/CSS). Since v2.3 it can format and lint the JS/TS in `<script>` and CSS in `<style>` of `.astro`/`.svelte` files, but framework support is **experimental and opt-in**. Biome cannot type-check or deeply lint Svelte template control-flow — pair it with `astro check` (types) for full coverage.
+Biome is the formatter and linter for JS/TS/JSON/CSS. Its Vue/Svelte/Astro support is opt-in and still experimental — per the Biome v2.3 release, "this feature is marked as experimental… To enable the feature, you'll have to opt in the new `html.experimentalFullSupportEnabled` option." Turn off the handful of rules that false-positive across the embedded-language boundary in `.svelte`/`.astro` files. Since v2.4 Biome handles most Svelte 5 control-flow syntax (`{#if}{/if}`), but per its docs "newer features, rare syntax, or edge cases might not be covered yet." Biome does **not** type-check, so it complements — never replaces — `astro check` and `svelte-check`.
 
 ```jsonc
 // biome.json
 {
-  "$schema": "https://biomejs.dev/schemas/2.5.1/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.12/schema.json",
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
-  "files": { "ignoreUnknown": true },
-  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
-  "assist": { "actions": { "source": { "organizeImports": "on" } } },
+  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2 },
   "linter": { "enabled": true, "rules": { "recommended": true } },
-  "html": { "formatter": { "enabled": true } },
+  "html": { "experimentalFullSupportEnabled": true },
   "overrides": [
     {
       "includes": ["**/*.svelte", "**/*.astro"],
@@ -864,40 +539,92 @@ Biome is the formatter and linter (replacing Prettier + ESLint for JS/TS/JSON/CS
 }
 ```
 
-Turning off `useConst`, `useImportType`, `noUnusedVariables`, and `noUnusedImports` for `.svelte`/`.astro` prevents false positives from Biome's partial understanding of these embedded languages. To opt into deeper HTML-ish parsing (Svelte `{#if}` control flow, `:global`), enable `html.experimentalFullHtmlSupportEnabled` — treat it as experimental.
+Commands: `biome check --write .` formats and applies safe lint fixes; `biome check .` is the read-only CI gate. Run through Bun with `bunx biome check .` if Biome is not a direct dependency.
 
-Commands:
+Type-check separately: `astro check` (validates `.astro` files and frontmatter, uses the Astro language server) and `bunx svelte-check` (validates `.svelte` components). Both should run in CI alongside `biome check`.
 
-```bash
-biome check --write .   # format + lint + organize imports, applying safe fixes
-biome format --write .  # format only
-biome lint .            # lint only
-biome ci .              # CI mode (no writes, non-zero on issues)
+## Testing
+
+Split by what you are testing:
+
+- **Plain-TypeScript logic** (utilities in `src/lib`, not touching Svelte or Astro compilation): `bun test` — fast, zero config. Note that `bun test` cannot compile runes, so it cannot test `.svelte` or `.svelte.ts` files.
+- **Svelte 5 components**: Vitest in Browser Mode with `vitest-browser-svelte`, which renders in a real browser via Playwright — the reliable path for Svelte 5 reactivity (jsdom plus the older `@testing-library/svelte` struggles with runes). Requires Vitest 4.
+- **Astro components**: the experimental Container API (`astro/container`) or `vitest-browser-astro`, driven through Astro's `getViteConfig()` so path aliases and config resolve.
+- **End-to-end**: Playwright.
+
+```ts
+// vitest.config.ts
+import { getViteConfig } from 'astro/config';
+import { playwright } from '@vitest/browser-playwright';
+
+export default getViteConfig({
+  test: {
+    browser: {
+      enabled: true,
+      provider: playwright(),
+      headless: true,
+      instances: [{ browser: 'chromium' }],
+    },
+  },
+});
 ```
 
-Biome's `assist` action organizes imports; do not also run a separate import-sorter. Biome does **not** replace `astro check`/`svelte-check` for type errors — run both in `check`.
+```ts
+// src/components/SearchList.test.ts
+import { render } from 'vitest-browser-svelte';
+import { expect, test } from 'vitest';
+import SearchList from './SearchList.svelte';
 
-## Deployment adapters
+test('filters items and shows empty state', async () => {
+  const screen = render(SearchList, {
+    items: [{ id: '1', name: 'Apple' }, { id: '2', name: 'Banana' }],
+  });
+  await screen.getByPlaceholder('Search…').fill('ban');
+  await expect.element(screen.getByText('Banana')).toBeVisible();
+  await screen.getByPlaceholder('Search…').fill('zzz');
+  await expect.element(screen.getByText(/No matches/)).toBeVisible();
+});
+```
 
-Choose an adapter by target: `@astrojs/node` (self-hosted/Docker, `mode: "standalone"` or `"middleware"`), `@astrojs/cloudflare`, `@astrojs/vercel`, or `@astrojs/netlify`. An adapter is required for on-demand rendering, actions, sessions, and server islands. Astro 7 adds experimental CDN cache providers (`cacheNetlify()`, `cacheVercel()`, `cacheCloudflare()`) that push route-cache directives to the edge.
+`getViteConfig()` propagates your Astro config (including `$lib` aliases) into the test environment, so no separate alias wiring is needed.
 
 ## Anti-patterns to avoid
 
-| Wrong (adjacent-ecosystem habit) | Right (this stack) |
-| --- | --- |
-| `export let foo` / `on:click` / `$:` | `let { foo } = $props()` / `onclick` / `$derived` |
-| `$effect` to copy one state into another | `$derived` / `$derived.by` |
-| `new Component({ target })` | `mount(Component, { target })` |
-| Passing a callback function as an island prop | Share state via nanostores; keep props serializable |
-| Expecting two `client:*` islands to share a module singleton | Cross-island state through nanostores |
-| `import { useStore } from "@nanostores/svelte"` | No such package: `$store` in `.svelte`, `@nanostores/svelte-runes` (`.current`) in `.svelte.ts` |
-| Adding a `tailwind.config.js` + PostCSS + `@apply` in CSS | Configure `uno.config.ts`; use `transformerDirectives` for `@apply` |
-| Relying on default UnoCSS scan for `.ts` variant files | Add `content.pipeline.include` glob for `(components\|src)/**/*.{js,ts}` |
-| Running `shadcn-svelte init` and getting Tailwind v4 wired in | Use `presetShadcn` in UnoCSS; hand-place `utils.ts`/`components.json` |
-| `npm install` / committing `package-lock.json` | `bun install`; commit `bun.lock` |
-| `process.env.SECRET` / bare `import.meta.env` for schema vars | `astro:env/server` and `astro:env/client` |
-| `type: 'content'` in a collection | `loader: glob(...)` / `file(...)` from `astro/loaders` |
-| `<ViewTransitions />` | `<ClientRouter />` from `astro:transitions` |
-| Trusting Biome to catch Svelte template type errors | Run `astro check` for types alongside Biome |
-| `client:load` on everything | Default to `client:visible`; reserve `client:load` for above-the-fold |
-| Passing functions to `server:defer` props | Serializable props only; fetch inside the island |
+| Wrong | Why | Right |
+|---|---|---|
+| `export let title` / `$: doubled = n * 2` / `on:click` in a `.svelte` file | Svelte 4 legacy syntax; not idiomatic in runes-mode Svelte 5 | `let { title } = $props()`, `const doubled = $derived(n * 2)`, `onclick={...}` |
+| `$effect(() => { b = a * 2 })` to sync state | Effects for derivation cause tangled reactivity and update loops | `const b = $derived(a * 2)` |
+| `new Counter({ target })` to mount | Class component API removed in Svelte 5 | `mount(Counter, { target, props })` |
+| `import { page } from '$app/state'` / `+page.server.ts` | SvelteKit APIs; this is Astro | Astro `Astro.params`, Actions, content collections, middleware |
+| Running shadcn-svelte's Tailwind `init` and adding `tailwindcss` | Stack styles with UnoCSS; two engines conflict | Manual setup + `unocss-preset-shadcn`, empty `tailwind.config.js` for the CLI |
+| UnoCSS config without `extractor-svelte` or `.ts` in `content.pipeline` | `class:` directives and shadcn barrel classes silently dropped from CSS | Add `extractorSvelte()` and `'(components|src)/**/*.{js,ts}'` |
+| Sharing a `.svelte.ts` rune singleton across two separate islands | Islands hydrate as independent roots; instance not shared | nanostores for cross-island state; runes within one island |
+| Passing a function as a prop to `server:defer` or a `client:*` island | Island/server props are serialized; functions can't cross the boundary | Pass serializable data; keep callbacks inside the island |
+| `client:load` on every interactive component | Ships JS eagerly, defeats islands | `client:idle`/`client:visible`; static `.astro` where no interactivity is needed |
+| Using `entry.render()` / `entry.slug` | Removed in current content layer | `render(entry)` and `entry.id` |
+| Assuming remark/rehype plugins work out of the box | Astro 7's default Markdown pipeline is native, not unified | Reinstall/configure the remark pipeline explicitly if plugins are needed |
+| `bun test` on `.svelte` components | Bun's runner can't compile runes | Vitest Browser Mode + `vitest-browser-svelte` |
+| A community Bun *adapter* on Astro 7 | Current Bun adapters pin to older Astro majors | `@astrojs/node` standalone, launched with `bun` |
+| Reading secrets via `import.meta.env` in client code | No validation, risks leaking to the bundle | `astro:env` schema; `secret`/`server` vars stay server-side |
+
+## Version & compatibility
+
+| Component | Targeted line | Notes / floor |
+|---|---|---|
+| Bun | 1.4.x | Runtime, package manager, `bun test`, `bun.lock` text lockfile |
+| Astro | 7.x | Stable since 7.0 (June 22, 2026); Vite 8 + Rolldown; native Rust Markdown pipeline |
+| Node (build/tooling floor) | 22.12+ | Required by Vite 8 / Astro 7 build tooling even when deploying on Bun |
+| `@astrojs/node` | current | Idiomatic SSR adapter; run the standalone server under Bun |
+| Svelte | 5.56.x | Runes mode only; legacy syntax excluded from new code |
+| `@astrojs/svelte` | 8.1.x | Svelte 5 support; compatible with Astro 7 |
+| UnoCSS (`unocss`, `unocss/astro`) | 66.x | `presetWind4` (oklch); `@unocss/astro` sub-package trails the meta-package — pin deliberately |
+| `unocss-preset-shadcn` | 1.0.x | Defaults to `presetWind4`; README sample still shows `presetWind3` (out of date) |
+| shadcn-svelte | 1.6.x | CLI; runes-native; built on `bits-ui` 2.x; `cn` = `tailwind-merge` + `clsx` |
+| Biome | 2.5.x | Svelte/Astro support experimental (`html.experimentalFullSupportEnabled`); no type-checking |
+| TypeScript | 5.x | `astro/tsconfigs/strict`; validate via `astro check` + `svelte-check` |
+| Vitest | 4.x | Browser Mode + `vitest-browser-svelte` 3.x for Svelte 5 components |
+| Playwright | current | E2E and Vitest Browser Mode provider |
+
+**Unresolved constraint:** shadcn-svelte officially targets Tailwind v4, so its UnoCSS path depends on the community `unocss-preset-shadcn` + `presetWind4` combination, which has no official support from either project and is newer than the Tailwind path. Treat it as working-but-verify: confirm token rendering before shipping.
+
+- **Research date:** 2026-09-05
